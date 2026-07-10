@@ -645,7 +645,11 @@ function showQuarantineList(api: TuiApi, session: ConfigDialogSession): void {
   showQuarantineEntries(api, session, store.snapshot());
 }
 
-function showQuarantineEntries(api: TuiApi, session: ConfigDialogSession, entries: Array<{ model: string; reason: string; expiresAt: number }>): void {
+function showQuarantineEntries(
+  api: TuiApi,
+  session: ConfigDialogSession,
+  entries: Array<{ model: string; reason: string; expiresAt: number; errorType?: string }>,
+): void {
   if (entries.length === 0) {
     showAlert(api, "No quarantines", "The quarantine store is empty.", () =>
       showQuarantineMenu(api, session),
@@ -658,7 +662,13 @@ function showQuarantineEntries(api: TuiApi, session: ConfigDialogSession, entrie
     .map((entry) => ({
       title: entry.model,
       value: entry.model,
-      description: `${entry.reason} · ${formatExpiry(entry.expiresAt)}`,
+      // model-fallback-error-classification (SDD change) — Slice 1, task
+      // 10. Display-only: appended only when present so legacy entries
+      // (no `errorType`) render exactly as before.
+      description:
+        entry.errorType !== undefined
+          ? `${entry.reason} · ${entry.errorType} · ${formatExpiry(entry.expiresAt)}`
+          : `${entry.reason} · ${formatExpiry(entry.expiresAt)}`,
     }));
   options.push({ title: "Back", value: "__back__" });
   api.ui.dialog.replace(() => renderSelect(api, {

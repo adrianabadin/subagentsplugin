@@ -43,7 +43,17 @@ import { select as defaultSelect } from "./select.js";
 import { DEFAULT_LADDER } from "./policy.js";
 import { MISSING_EVIDENCE_CONFIDENCE } from "./evidence.js";
 import { normalizePhase } from "./phases.js";
-import { QuarantineStore } from "./quarantine.js";
+import { QuarantineStore, resolveQuarantineTtlMs, type QuarantineErrorType } from "./quarantine.js";
+import {
+  classifyError,
+  extractResetHintMs,
+  ERROR_SCAN_WINDOW,
+  PROVIDER_ERROR_PATTERN as CLASSIFIER_PROVIDER_ERROR_PATTERN,
+  providerErrorCode,
+  rateLimitCode,
+  type ClassifiedError,
+  type ErrorType,
+} from "./error-classification.js";
 import type { Logger } from "./logger.js";
 import type {
   AuditEntry,
@@ -292,38 +302,38 @@ export function defaultCandidateFactory(deps: ResolveCandidatesDeps): SelectCand
  * (case-insensitive). Returns `true` iff the output looks like a
  * provider rate-limit response.
  */
-const RATE_LIMIT_PATTERN =
-  /usage_limit_reached|usage limit has been reached|rate[-_ ]limit(?:_exceeded)?|HTTP[-_ ]?429|AI_APICallError[\s\S]{0,200}?429|\b429\b/i;
-const RATE_LIMIT_SCAN_WINDOW = 16_384;
+/**
+ * `RATE_LIMIT_SCAN_WINDOW` — kept as a local alias of the canonical
+ * `ERROR_SCAN_WINDOW` from `error-classification.ts` so call sites below
+ * that still reference it by its historical name do not need renaming.
+ */
+const RATE_LIMIT_SCAN_WINDOW = ERROR_SCAN_WINDOW;
 
+/**
+ * `detectRateLimit` / `detectProviderError` / `matchProviderErrorReason` /
+ * `matchReason` are now THIN WRAPPERS over `src/error-classification.ts`'s
+ * `classifyError` (design #1623 "Taxonomy location"). Existing exported
+ * names and signatures are unchanged — callers outside this module see no
+ * difference. `classifyError`'s fixed precedence
+ * (model_not_configured > provider_error > rate_limit > other) means a
+ * `model_not_configured` match no longer also reports as `rate_limit`
+ * from these wrappers; that is the intended, more-correct behavior per
+ * spec #1620 "Multiple pattern match precedence".
+ */
 export function detectRateLimit(output: string): boolean {
-  if (typeof output !== "string" || output.length === 0) return false;
-  const head = output.length > RATE_LIMIT_SCAN_WINDOW ? output.slice(0, RATE_LIMIT_SCAN_WINDOW) : output;
-  return RATE_LIMIT_PATTERN.test(head);
+  const classified = classifyError(output);
+  return classified?.type === "rate_limit";
 }
 
-export const PROVIDER_ERROR_PATTERN =
-  /invalid_api_key|API key not found|Unauthorized|billing[-_ ]not[-_ ]active|credit[-_ ]limit|payment[-_ ]required|insufficient[-_ ]funds|auth[-_ ]failed|unauthorized[-_ ]client|authentication[-_ ]failed|invalid[-_ ]credentials/i;
+export const PROVIDER_ERROR_PATTERN = CLASSIFIER_PROVIDER_ERROR_PATTERN;
 
 export function detectProviderError(output: string): boolean {
-  if (typeof output !== "string" || output.length === 0) return false;
-  const head = output.length > RATE_LIMIT_SCAN_WINDOW ? output.slice(0, RATE_LIMIT_SCAN_WINDOW) : output;
-  return PROVIDER_ERROR_PATTERN.test(head);
+  const classified = classifyError(output);
+  return classified?.type === "provider_error";
 }
 
 export function matchProviderErrorReason(text: string): string {
-  if (/invalid_api_key/i.test(text)) return "invalid_api_key";
-  if (/API key not found/i.test(text)) return "API key not found";
-  if (/Unauthorized/i.test(text)) return "Unauthorized";
-  if (/billing[-_ ]not[-_ ]active/i.test(text)) return "billing_not_active";
-  if (/credit[-_ ]limit/i.test(text)) return "credit_limit";
-  if (/payment[-_ ]required/i.test(text)) return "payment_required";
-  if (/insufficient[-_ ]funds/i.test(text)) return "insufficient_funds";
-  if (/auth[-_ ]failed/i.test(text)) return "auth_failed";
-  if (/unauthorized[-_ ]client/i.test(text)) return "unauthorized_client";
-  if (/authentication[-_ ]failed/i.test(text)) return "authentication_failed";
-  if (/invalid[-_ ]credentials/i.test(text)) return "invalid_credentials";
-  return "provider_error";
+  return providerErrorCode(text);
 }
 
 /**
@@ -411,7 +421,10 @@ export interface QuarantineAuditEntry {
   nextViableModel: string | null;
 }
 
-export type AfterHook = (input: HookInput, output: { output?: unknown }) => Promise<void>;
+export type AfterHook = (
+  input: HookInput,
+  output: { output?: unknown; metadata?: unknown },
+) => Promise<void>;
 
 function findNextViableModel(
   catalog: AfterHookCatalogSlice,
@@ -461,16 +474,29 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     if (parseGeneratedAlias(tracked.targetAlias) === null) return;
 
     const text = typeof output.output === "string" ? output.output : "";
-    const isRateLimit = detectRateLimit(text);
-    const isProviderError = detectProviderError(text);
-    if (!isRateLimit && !isProviderError) return;
+    // model-fallback-error-classification (SDD change) — Slice 1, task 8.
+    // Spec #1620 "Structured Error Classification": classify via the
+    // canonical `classifyError` (model_not_configured > provider_error >
+    // rate_limit > other, first-match-wins). `other` (or no failure text
+    // at all) means nothing is quarantined and no audit entry is written
+    // — mirrors the pre-existing "neither pattern matched" early return.
+    const classified: ClassifiedError | null = classifyError(text);
+    if (classified === null || classified.type === "other") return;
+    const errorType = classified.type as QuarantineErrorType;
 
-    // Best-effort reason: a short label derived from the first matching
-    // pattern. We don't try to be exhaustive — the audit captures the
-    // raw pattern hit, callers can grep their own logs.
-    const reason = isProviderError ? matchProviderErrorReason(text) : matchReason(text);
-    const ttlMs = isProviderError ? Infinity : rateLimitTtlMsForModel(tracked.model);
-    const entry = quarantine.add(tracked.model, reason, ttlMs);
+    // Best-effort reason: a short label derived from the classifier's
+    // matched pattern code. The audit captures the raw excerpt too, so
+    // callers can grep their own logs for anything not exhaustively
+    // labeled here.
+    const reason = classified.code;
+    // Prefer a real reset signal from output.metadata when present
+    // (design #1623 "Retry-After signal" — best-effort, currently
+    // documents that OpenCode never populates these keys); otherwise
+    // fall back to the static per-error-type defaults centralized in
+    // `resolveQuarantineTtlMs` (quarantine.ts).
+    const ttlHintMs = extractResetHintMs(output.metadata);
+    const ttlMs = resolveQuarantineTtlMs({ errorType, model: tracked.model, ttlHintMs });
+    const entry = quarantine.add(tracked.model, reason, ttlMs, errorType);
     const nextViable = findNextViableModel(
       catalog,
       tracked.originalSubagentType,
@@ -512,27 +538,16 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
 }
 
 function matchReason(text: string): string {
-  // Map the first matching pattern to a short, audit-friendly label.
-  if (/usage_limit_reached/i.test(text)) return "usage_limit_reached";
-  if (/usage limit has been reached/i.test(text)) return "usage limit has been reached";
-  if (/rate[-_ ]limit/i.test(text)) return "rate_limit";
-  if (/HTTP[-_ ]?429/i.test(text)) return "HTTP 429";
-  if (/AI_APICallError[\s\S]{0,200}?429/i.test(text)) return "AI_APICallError 429";
-  return "429";
+  // Thin wrapper over the canonical rate-limit code matcher in
+  // error-classification.ts (design #1623 "Taxonomy location").
+  return rateLimitCode(text);
 }
 
-function providerOfModel(model: string): string {
-  if (typeof model !== "string") return "";
-  const slash = model.indexOf("/");
-  if (slash <= 0) return "";
-  return model.slice(0, slash).toLowerCase();
-}
-
-function rateLimitTtlMsForModel(model: string): number | undefined {
-  const provider = providerOfModel(model);
-  if (provider === "google") return 2 * 60 * 60 * 1000;
-  return undefined;
-}
+// NOTE: the google=2h / other=60min static defaults previously computed
+// here (`providerOfModel` + `rateLimitTtlMsForModel`) now live in
+// `resolveQuarantineTtlMs` (src/quarantine.ts) — centralized there
+// because TTL policy is quarantine-domain (design #1623 "Quarantine
+// reason").
 
 export function createTaskHook(
   config: HooksConfig,

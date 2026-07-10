@@ -409,5 +409,9 @@ export function formatQuarantineEntry(entry: QuarantineEntry, nowMs: number): st
       : entry.expiresAt <= nowMs
         ? "expired"
         : `expires ${new Date(entry.expiresAt).toISOString()}`;
-  return `${entry.model}\t${entry.reason}\t${until}`;
+  // model-fallback-error-classification (SDD change) — Slice 1, task 10.
+  // Display-only: appended only when present so legacy entries (no
+  // `errorType`) render exactly as before — no behavior change.
+  const errorTypeSuffix = entry.errorType !== undefined ? `\t${entry.errorType}` : "";
+  return `${entry.model}\t${entry.reason}\t${until}${errorTypeSuffix}`;
 }

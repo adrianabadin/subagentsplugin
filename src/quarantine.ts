@@ -55,6 +55,16 @@ import {
   resolveQuarantineTarget,
 } from "./model-groups.js";
 
+/**
+ * model-fallback-error-classification (SDD change) — Slice 1, task 5-6.
+ * Structured classification tag, additive on top of the existing free-form
+ * `reason` string. `"manual"` covers user-initiated quarantines that carry
+ * no automatic classification (TUI/CLI `add`/`addManual` without an
+ * explicit errorType). Backward compatible: absent on old persisted files
+ * and on any caller that does not pass it.
+ */
+export type QuarantineErrorType = "rate_limit" | "model_not_configured" | "provider_error" | "manual";
+
 export interface QuarantineEntry {
   model: string;
   reason: string;
@@ -65,6 +75,12 @@ export interface QuarantineEntry {
    * (in-memory only — must NOT survive restart).
    */
   manual?: boolean;
+  /**
+   * Structured classification tag (spec #1620 "Error-Type-Driven
+   * Quarantine TTL"). Purely additive: absent/undefined on entries
+   * created before this field existed or by callers that do not pass it.
+   */
+  errorType?: QuarantineErrorType;
 }
 
 export interface QuarantineBlocklist {
@@ -92,6 +108,8 @@ interface SerializedEntry {
   reason: string;
   expiresAt: number | null;
   manual?: boolean;
+  /** Additive — see `QuarantineEntry.errorType`. Absent on old files. */
+  errorType?: QuarantineErrorType;
 }
 
 function serializeEntry(entry: QuarantineEntry): SerializedEntry {
@@ -101,7 +119,64 @@ function serializeEntry(entry: QuarantineEntry): SerializedEntry {
     expiresAt: entry.expiresAt === Infinity ? null : entry.expiresAt,
   };
   if (entry.manual === true) out.manual = true;
+  if (entry.errorType !== undefined) out.errorType = entry.errorType;
   return out;
+}
+
+const VALID_ERROR_TYPES: readonly QuarantineErrorType[] = [
+  "rate_limit",
+  "model_not_configured",
+  "provider_error",
+  "manual",
+];
+
+function isQuarantineErrorType(value: unknown): value is QuarantineErrorType {
+  return typeof value === "string" && (VALID_ERROR_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * model-fallback-error-classification (SDD change) — Slice 1, task 6.
+ * Spec #1620 "Error-Type-Driven Quarantine TTL". Pure function: derives
+ * the `ttlMs` a caller should pass to `QuarantineStore.add()` from a
+ * classified error type. Centralized here (rather than duplicated in
+ * `hooks.ts`) because TTL policy is quarantine-domain, not
+ * classification-domain.
+ *
+ * - `model_not_configured` → `Infinity` (permanent — the model will
+ *   never work until manually released).
+ * - `provider_error` → `Infinity` (permanent — unchanged pre-existing
+ *   behavior; auth/billing failures do not self-heal on a timer).
+ * - `rate_limit` → prefers a real reset signal (`ttlHintMs`) when
+ *   present; otherwise `undefined` so the caller applies the existing
+ *   static defaults (google=2h via the `google` provider check below,
+ *   other=60min = `QuarantineStore`'s own default).
+ * - `other` / `undefined` → `undefined` (store default applies).
+ *
+ * Returns `undefined` to mean "no override — let `QuarantineStore`'s own
+ * default TTL apply", NEVER to mean "no quarantine".
+ */
+export function resolveQuarantineTtlMs(params: {
+  /**
+   * Accepts `"other"` too (the classifier's guaranteed fallback type) even
+   * though `QuarantineErrorType` does not include it — callers that have
+   * not yet filtered out `"other"` can pass it straight through and get
+   * `undefined` back, same as omitting `errorType` entirely.
+   */
+  errorType?: QuarantineErrorType | "other";
+  model: string;
+  ttlHintMs?: number;
+}): number | undefined {
+  const { errorType, model, ttlHintMs } = params;
+  if (errorType === "model_not_configured") return Infinity;
+  if (errorType === "provider_error") return Infinity;
+  if (errorType === "rate_limit") {
+    if (ttlHintMs !== undefined) return ttlHintMs;
+    const slash = model.indexOf("/");
+    const provider = slash > 0 ? model.slice(0, slash).toLowerCase() : "";
+    if (provider === "google") return 2 * 60 * 60 * 1000;
+    return undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -140,17 +215,22 @@ export class QuarantineStore implements QuarantineBlocklist {
    * member returns `true`.  The returned `QuarantineEntry` carries the
    * original (caller-supplied) model string for audit backwards-compat.
    */
-  add(model: string, reason: string, ttlMs?: number): QuarantineEntry {
+  add(model: string, reason: string, ttlMs?: number, errorType?: QuarantineErrorType): QuarantineEntry {
     const expiresAt = ttlMs === Infinity ? Infinity : this.now() + (ttlMs ?? this.ttlMs);
-    const entry: QuarantineEntry = { model, reason, expiresAt };
+    const entry: QuarantineEntry = { model, reason, expiresAt, ...(errorType !== undefined ? { errorType } : {}) };
     // Expand the model to all equivalent group aliases so the router
     // cannot evade quarantine by selecting a different alias for the
     // same underlying model group.
     const group = resolveModelGroup(model);
     for (const alias of group) {
-      this.entries.set(alias, { model: alias, reason, expiresAt });
+      this.entries.set(alias, {
+        model: alias,
+        reason,
+        expiresAt,
+        ...(errorType !== undefined ? { errorType } : {}),
+      });
     }
-    this.logger?.info("quarantine", `add model=${model} reason=${reason} ttlMs=${ttlMs ?? this.ttlMs} permanent=${expiresAt === Infinity} manual=false group=${group.length > 1 ? `expanded to ${group.length} aliases` : "singleton"}`);
+    this.logger?.info("quarantine", `add model=${model} reason=${reason} ttlMs=${ttlMs ?? this.ttlMs} permanent=${expiresAt === Infinity} manual=false errorType=${errorType ?? "(none)"} group=${group.length > 1 ? `expanded to ${group.length} aliases` : "singleton"}`);
     return entry;
   }
 
@@ -169,18 +249,31 @@ export class QuarantineStore implements QuarantineBlocklist {
   addManual(
     model: string,
     reason: string,
-    opts: { permanent?: boolean; ttlMs?: number } = {},
+    opts: { permanent?: boolean; ttlMs?: number; errorType?: QuarantineErrorType } = {},
   ): QuarantineEntry {
     const ttl = opts.permanent === true ? Infinity : (opts.ttlMs ?? this.ttlMs);
     const expiresAt = ttl === Infinity ? Infinity : this.now() + ttl;
     const group = resolveQuarantineTarget(model);
-    const entry: QuarantineEntry = { model, reason, expiresAt, manual: true };
+    const errorType = opts.errorType;
+    const entry: QuarantineEntry = {
+      model,
+      reason,
+      expiresAt,
+      manual: true,
+      ...(errorType !== undefined ? { errorType } : {}),
+    };
     for (const alias of group) {
-      this.entries.set(alias, { model: alias, reason, expiresAt, manual: true });
+      this.entries.set(alias, {
+        model: alias,
+        reason,
+        expiresAt,
+        manual: true,
+        ...(errorType !== undefined ? { errorType } : {}),
+      });
     }
     this.logger?.info(
       "quarantine",
-      `addManual model=${model} reason=${reason} ttlMs=${ttl === Infinity ? "Infinity" : ttl} permanent=${expiresAt === Infinity} manual=true group=${group.length > 1 ? `expanded to ${group.length} aliases` : "singleton"}`,
+      `addManual model=${model} reason=${reason} ttlMs=${ttl === Infinity ? "Infinity" : ttl} permanent=${expiresAt === Infinity} manual=true errorType=${errorType ?? "(none)"} group=${group.length > 1 ? `expanded to ${group.length} aliases` : "singleton"}`,
     );
     return entry;
   }
@@ -384,6 +477,9 @@ export class QuarantineStore implements QuarantineBlocklist {
 
       const expiresAtRaw = entry.expiresAt;
       const isManual = entry.manual === true;
+      // Additive, backward-compatible: absent on files written before
+      // this field existed → stays `undefined` (never throws).
+      const errorType = isQuarantineErrorType(entry.errorType) ? entry.errorType : undefined;
 
       if (expiresAtRaw === null) {
         // null → permanent (Infinity) — restore.
@@ -400,6 +496,7 @@ export class QuarantineStore implements QuarantineBlocklist {
             reason: entry.reason,
             expiresAt: Infinity,
             manual: true,
+            ...(errorType !== undefined ? { errorType } : {}),
           });
         }
         loaded += 1;
@@ -433,6 +530,7 @@ export class QuarantineStore implements QuarantineBlocklist {
           reason: entry.reason,
           expiresAt: expiresAtRaw,
           manual: true,
+          ...(errorType !== undefined ? { errorType } : {}),
         });
       }
       loaded += 1;

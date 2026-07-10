@@ -243,6 +243,28 @@ describe("formatQuarantineEntry", () => {
       formatQuarantineEntry({ model: "a/b", reason: "r", expiresAt: FIXED_NOW - 1 }, FIXED_NOW),
     ).toContain("expired");
   });
+
+  /* ------------------------------------------------------------------ *
+   * model-fallback-error-classification (SDD change) — Slice 1, task 9.
+   * Spec #1620 / design #1623: `errorType` is display-only when present;
+   * legacy entries WITHOUT it (pre-change persisted files) must still
+   * render without error (no behavior change to the row's other fields).
+   * ------------------------------------------------------------------ */
+  it("displays errorType in the row when present", () => {
+    const line = formatQuarantineEntry(
+      { model: "openai/gpt-99", reason: "model_not_found", expiresAt: Infinity, errorType: "model_not_configured" },
+      FIXED_NOW,
+    );
+    expect(line).toContain("model_not_configured");
+  });
+
+  it("renders legacy entries without errorType without throwing (backward compatible)", () => {
+    expect(() =>
+      formatQuarantineEntry({ model: "a/b", reason: "r", expiresAt: Infinity }, FIXED_NOW),
+    ).not.toThrow();
+    const line = formatQuarantineEntry({ model: "a/b", reason: "r", expiresAt: Infinity }, FIXED_NOW);
+    expect(line).toBe("a/b\tr\tpermanent");
+  });
 });
 
 describe("parseQuarantineFile", () => {

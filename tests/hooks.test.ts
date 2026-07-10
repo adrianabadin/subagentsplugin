@@ -1084,3 +1084,253 @@ describe("createAfterHook() — provider and billing errors (permanent quarantin
     expect(snap[0]?.expiresAt).toBe(Infinity);
   });
 });
+
+/* -------------------------------------------------------------------------- *
+ * model-fallback-error-classification (SDD change) — Slice 1, task 3-4.
+ * design #1623: `detectRateLimit` / `detectProviderError` /
+ * `matchProviderErrorReason` become thin wrappers/re-exports over the new
+ * `src/error-classification.ts` pure module. This block pins:
+ *   1. Existing exported signatures/behavior are unchanged for every case
+ *      the original hand-written patterns already covered (no regression).
+ *   2. The wrappers now also recognize the classifier's newly-added
+ *      patterns (e.g. `quota` for rate_limit) — proof they truly delegate
+ *      to `classifyError` rather than keeping a stale local copy.
+ * -------------------------------------------------------------------------- */
+describe("hooks.ts detectors delegate to error-classification.ts", () => {
+  it("detectRateLimit still recognizes every pre-existing rate-limit case (no regression)", () => {
+    expect(detectRateLimit("Error: usage_limit_reached — try again later")).toBe(true);
+    expect(detectRateLimit("AI_APICallError: usage limit has been reached for minimax/M3")).toBe(true);
+    expect(detectRateLimit("provider error: rate_limit_exceeded")).toBe(true);
+    expect(detectRateLimit("upstream returned HTTP 429 Too Many Requests")).toBe(true);
+    expect(detectRateLimit("request failed: 429 (rate limited)")).toBe(true);
+    expect(detectRateLimit("agent finished successfully; see attached diff.")).toBe(false);
+    expect(detectRateLimit("")).toBe(false);
+  });
+
+  it("detectProviderError still recognizes every pre-existing provider-error case (no regression)", () => {
+    expect(detectProviderError("Error: invalid_api_key — check credentials")).toBe(true);
+    expect(detectProviderError("401 Unauthorized")).toBe(true);
+    expect(detectProviderError("usage_limit_reached")).toBe(false);
+    expect(detectProviderError("success")).toBe(false);
+  });
+
+  it("matchProviderErrorReason still maps every pre-existing reason code (no regression)", () => {
+    expect(matchProviderErrorReason("invalid_api_key supplied")).toBe("invalid_api_key");
+    expect(matchProviderErrorReason("billing-not-active on account")).toBe("billing_not_active");
+    expect(matchProviderErrorReason("some unmapped provider failure")).toBe("provider_error");
+  });
+
+  it("detectRateLimit now also recognizes the classifier's new 'quota' pattern (proves delegation, not a stale copy)", () => {
+    // hooks.ts's own hand-written RATE_LIMIT_PATTERN never included
+    // "quota" — this only passes once detectRateLimit truly delegates to
+    // src/error-classification.ts's classifyError().
+    expect(detectRateLimit("quota exceeded for this account")).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * model-fallback-error-classification (SDD change) — Slice 1, task 7-8.
+ * Spec #1620 "Structured Error Classification" scenarios "Untracked callID
+ * ignored" / "Non-task tools ignored" (already covered by the pre-existing
+ * "skips non-task tools" / "skips unknown callIDs" tests above — those
+ * guards run BEFORE any classification call). This block pins the NEW
+ * behavior: the after hook now classifies via `classifyError` (not just
+ * detectRateLimit/detectProviderError) and threads the resulting
+ * `errorType` into `quarantine.add(model, reason, ttlMs, errorType)`.
+ * -------------------------------------------------------------------------- */
+describe("createAfterHook() — error classification wiring (errorType)", () => {
+  function buildTrackingWith(
+    callID: string,
+    targetAlias: string,
+    model: string,
+    original: string,
+  ): Map<string, unknown> {
+    const m = new Map<string, unknown>();
+    m.set(callID, { originalSubagentType: original, targetAlias, model });
+    return m;
+  }
+
+  function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
+    byBase: Record<string, Array<{ modelId: string; ladderRung: LadderRung }>>;
+  } {
+    return {
+      byBase: Object.fromEntries(
+        Object.entries(byBase).map(([k, v]) => [
+          k,
+          v.map((entry) => ({ ...entry, ladderRung: "openai" as LadderRung })),
+        ]),
+      ),
+    };
+  }
+
+  it("a model_not_configured output quarantines PERMANENTLY with errorType='model_not_configured'", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-99");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-99", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-99" }, { modelId: "minimax/M3" }] });
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+    });
+
+    await hook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "c1" },
+      { output: "error: model not found in catalog for provider openai" },
+    );
+
+    expect(quarantine.isBlocked("openai/gpt-99")).toBe(true);
+    const snap = quarantine.snapshot();
+    const entry = snap.find((e) => e.model === "openai/gpt-99");
+    expect(entry?.expiresAt).toBe(Infinity);
+    expect(entry?.errorType).toBe("model_not_configured");
+  });
+
+  it("a rate_limit output quarantines with errorType='rate_limit'", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+    });
+
+    await hook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "c1" },
+      { output: "upstream returned HTTP 429 Too Many Requests" },
+    );
+
+    const snap = quarantine.snapshot();
+    const entry = snap.find((e) => e.model === "openai/gpt-4.1-mini");
+    expect(entry?.errorType).toBe("rate_limit");
+  });
+
+  it("a provider_error output quarantines PERMANENTLY with errorType='provider_error'", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+    });
+
+    await hook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "c1" },
+      { output: "invalid_api_key supplied" },
+    );
+
+    const snap = quarantine.snapshot();
+    const entry = snap.find((e) => e.model === "openai/gpt-4.1-mini");
+    expect(entry?.expiresAt).toBe(Infinity);
+    expect(entry?.errorType).toBe("provider_error");
+  });
+
+  it("a rate_limit output with a parseable output.metadata reset signal uses that TTL, not the static default", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const nowMs = 1_700_000_000;
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => nowMs });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+    });
+
+    await hook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "c1" },
+      { output: "HTTP 429", metadata: { retryAfter: 42_000 } },
+    );
+
+    const snap = quarantine.snapshot();
+    const entry = snap.find((e) => e.model === "openai/gpt-4.1-mini");
+    expect(entry?.expiresAt).toBe(nowMs + 42_000);
+  });
+
+  it("an 'other' (unclassifiable) output does NOT quarantine and does NOT audit", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }] });
+    const audit = vi.fn();
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      audit,
+    });
+
+    await hook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "c1" },
+      { output: "agent finished successfully; see attached diff." },
+    );
+
+    expect(quarantine.isBlocked("openai/gpt-4.1-mini")).toBe(false);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("classification, quarantine, and audit are ALL skipped for an untracked callID (no error)", async () => {
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }] });
+    const audit = vi.fn();
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: new Map(),
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      audit,
+    });
+
+    await expect(
+      hook(
+        { tool: { id: "task" }, sessionID: "s1", callID: "unknown-call" },
+        { output: "model not found for provider" },
+      ),
+    ).resolves.not.toThrow();
+
+    expect(quarantine.snapshot()).toEqual([]);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("classification, quarantine, and audit are ALL skipped for a non-task tool", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }] });
+    const audit = vi.fn();
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      audit,
+    });
+
+    await hook(
+      { tool: { id: "read" }, sessionID: "s1", callID: "c1" },
+      { output: "model not found for provider" },
+    );
+
+    expect(quarantine.snapshot()).toEqual([]);
+    expect(audit).not.toHaveBeenCalled();
+    // Tracking entry must still be present — the hook returned before
+    // even reaching the tracked-callID lookup, so nothing was consumed.
+    expect(tracking.has("c1")).toBe(true);
+  });
+});

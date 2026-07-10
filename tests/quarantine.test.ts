@@ -22,6 +22,7 @@ import {
   clearSharedQuarantineStore,
   defaultQuarantineFilePath,
   getSharedQuarantineStore,
+  resolveQuarantineTtlMs,
   setSharedQuarantineStore,
 } from "../src/quarantine.js";
 
@@ -837,6 +838,148 @@ describe("QuarantineStore — manual entries (addManual / persistence)", () => {
     expect(an?.expiresAt).toBe(1_000_000 + 7_200_000);
     expect(op?.manual).toBe(true);
     expect(an?.manual).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * model-fallback-error-classification (SDD change) — Slice 1, task 5-6.
+ * Spec #1620 "Error-Type-Driven Quarantine TTL" (quarantine MODIFIED
+ * requirement). `QuarantineEntry` / `SerializedEntry` gain an additive
+ * optional `errorType` field; `add`/`addManual` thread it through;
+ * `resolveQuarantineTtlMs` centralizes TTL derivation from error type.
+ *
+ * TDD ordering: these tests reference `resolveQuarantineTtlMs` (not yet
+ * exported from src/quarantine.ts) and the `errorType` field on
+ * `QuarantineEntry`. They are expected to FAIL until task 6 is
+ * implemented.
+ * -------------------------------------------------------------------------- */
+describe("QuarantineStore — errorType field (additive)", () => {
+  let tmpDir = "";
+
+  afterEach(async () => {
+    if (tmpDir) {
+      try { await rm(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
+      tmpDir = "";
+    }
+  });
+
+  async function makeTmpDir(): Promise<string> {
+    const dir = path.join(tmpdir(), `quarantine-errortype-test-${randomBytes(4).toString("hex")}`);
+    await mkdir(dir, { recursive: true });
+    tmpDir = dir;
+    return dir;
+  }
+
+  it("add() accepts and persists errorType on the returned entry + snapshot", () => {
+    const store = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_000_000 });
+    const entry = store.add("openai/gpt-5.5", "rate_limit", undefined, "rate_limit");
+    expect(entry.errorType).toBe("rate_limit");
+    const snap = store.snapshot();
+    expect(snap[0]?.errorType).toBe("rate_limit");
+  });
+
+  it("addManual() accepts and persists errorType via opts", () => {
+    const store = new QuarantineStore({ now: () => 1_000_000 });
+    const entry = store.addManual("minimax/M3", "manual-cli", { permanent: true, errorType: "manual" });
+    expect(entry.errorType).toBe("manual");
+    const snap = store.snapshot();
+    expect(snap[0]?.errorType).toBe("manual");
+  });
+
+  it("add() omits errorType when not supplied (backward compatible — undefined, not a default value)", () => {
+    const store = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_000_000 });
+    const entry = store.add("openai/gpt-5.5", "usage_limit_reached");
+    expect(entry.errorType).toBeUndefined();
+  });
+
+  it("saveToFile + loadFromFile round-trip preserves errorType on manual entries", async () => {
+    const dir = await makeTmpDir();
+    const filePath = path.join(dir, "quarantine.json");
+
+    const store1 = new QuarantineStore({ now: () => 1_000_000 });
+    store1.addManual("openai/gpt-5.5", "auto-permanent: model_not_configured", {
+      permanent: true,
+      errorType: "model_not_configured",
+    });
+    await store1.saveToFile(filePath);
+
+    const store2 = new QuarantineStore({ now: () => 2_000_000 });
+    await store2.loadFromFile(filePath);
+    const snap = store2.snapshot();
+    expect(snap[0]?.errorType).toBe("model_not_configured");
+  });
+
+  it("backward compat: loading a serialized file WITHOUT errorType does not throw; field is undefined", async () => {
+    const dir = await makeTmpDir();
+    const filePath = path.join(dir, "quarantine.json");
+    // Old-format persisted entry, written before this field existed.
+    const payload = JSON.stringify([
+      { model: "openai/gpt-5.5", reason: "manual-tui", expiresAt: null, manual: true },
+    ]);
+    await writeFile(filePath, payload, "utf8");
+
+    const store = new QuarantineStore({ now: () => 1_000_000 });
+    await expect(store.loadFromFile(filePath)).resolves.not.toThrow();
+    const snap = store.snapshot();
+    expect(snap[0]?.errorType).toBeUndefined();
+  });
+
+  describe("resolveQuarantineTtlMs — TTL derivation from error type", () => {
+    it("model_not_configured always resolves to Infinity (permanent)", () => {
+      expect(
+        resolveQuarantineTtlMs({ errorType: "model_not_configured", model: "openai/gpt-5.5" }),
+      ).toBe(Infinity);
+    });
+
+    it("rate_limit with a parseable reset signal uses that signal verbatim", () => {
+      expect(
+        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "openai/gpt-5.5", ttlHintMs: 42_000 }),
+      ).toBe(42_000);
+    });
+
+    it("rate_limit without a reset signal defaults to 2h for google models", () => {
+      expect(
+        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "google/gemini-3.5-flash" }),
+      ).toBe(2 * 60 * 60 * 1000);
+    });
+
+    it("rate_limit without a reset signal defaults to 60min (store default) for non-google models", () => {
+      expect(
+        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "openai/gpt-5.5" }),
+      ).toBeUndefined(); // undefined ⇒ caller falls back to QuarantineStore's own 60min default
+    });
+
+    it("provider_error always resolves to Infinity (permanent, unchanged from pre-existing behavior)", () => {
+      expect(
+        resolveQuarantineTtlMs({ errorType: "provider_error", model: "openai/gpt-5.5" }),
+      ).toBe(Infinity);
+    });
+
+    it("other / undefined errorType resolves to undefined (store default applies)", () => {
+      expect(resolveQuarantineTtlMs({ errorType: "other", model: "openai/gpt-5.5" })).toBeUndefined();
+      expect(resolveQuarantineTtlMs({ model: "openai/gpt-5.5" })).toBeUndefined();
+    });
+  });
+
+  it("saveToFile does not crash when the store is unwritable; logs failure, in-memory state is unaffected", async () => {
+    const warnLogs: string[] = [];
+    const logger = {
+      info: () => {},
+      warn: (_scope: string, msg: string) => warnLogs.push(msg),
+      trace: () => {},
+    } as unknown as import("../src/logger.js").Logger;
+
+    const store = new QuarantineStore({ now: () => 1_000_000, logger });
+    store.addManual("openai/gpt-5.5", "manual-cli", { permanent: true });
+
+    // An invalid path (embedded NUL byte) guarantees a write failure on
+    // every platform without touching real disk state.
+    const unwritablePath = path.join(tmpdir(), "quarantine-\0-invalid", "quarantine.json");
+
+    await expect(store.saveToFile(unwritablePath)).resolves.not.toThrow();
+    expect(warnLogs.some((line) => line.includes("saveToFile failed"))).toBe(true);
+    // In-memory state for the current invocation is untouched.
+    expect(store.isBlocked("openai/gpt-5.5")).toBe(true);
   });
 });
 
