@@ -108,6 +108,29 @@ export interface PluginClient {
       };
     }) => Promise<unknown> | unknown;
   };
+  /**
+   * model-fallback-error-classification (SDD change) — Slice 3, task 22.
+   * Design #1623 "Client wiring": loose structural surface for the
+   * recursive fallback engine (`src/fallback.ts`). Mirrors
+   * `client.session.create({body:{parentID?,title?}})` (sdk.gen.d.ts:114)
+   * and `client.session.prompt({path:{id}, body:{model:{providerID,
+   * modelID}, agent, parts}})` (sdk.gen.d.ts:174). Deliberately loose/
+   * optional — no SDK type import — so a client missing either method
+   * degrades the fallback engine to a graceful no-op instead of a crash.
+   */
+  session?: {
+    create?: (opts: {
+      body: { parentID?: string; title?: string };
+    }) => Promise<unknown> | unknown;
+    prompt?: (opts: {
+      path: { id: string };
+      body: {
+        model: { providerID: string; modelID: string };
+        agent: string;
+        parts: Array<{ type: string; text: string }>;
+      };
+    }) => Promise<unknown> | unknown;
+  };
 }
 
 /** Toast severity as accepted by OpenCode's `tui.showToast`. */
@@ -208,6 +231,17 @@ export interface ModelForecastPluginOptions {
      * the real global quarantine file.
      */
     filePath?: string;
+  };
+  /**
+   * model-fallback-error-classification (SDD change) — Slice 3, task 22.
+   * Recursive fallback layer (design #1623 "Fallback mechanism"). Gated
+   * by `enabled !== false` AND the client actually exposing
+   * `session.create`/`session.prompt` — the default is ON when a usable
+   * client is present, and disabling it restores pre-Slice-3 audit-only
+   * behavior (rollback plan, design #1623 "Migration / Rollout").
+   */
+  fallback?: {
+    enabled?: boolean;
   };
   /**
    * Override the model-data cache path for the config hook fallback
@@ -639,6 +673,48 @@ export default async function modelForecastPlugin(
     profileCatalog,
     { ...(quarantineEnabled ? { quarantine } : {}), logger },
   );
+
+  // model-fallback-error-classification (SDD change) — Slice 3, task 22.
+  // Design #1623 "Fallback mechanism" + "Re-entrancy guard". The after
+  // hook is constructed BEFORE the before hook (below) so its
+  // `fallbackSessionIDs` set can be shared into `createTaskHook`'s deps —
+  // both hooks MUST guard against the SAME set of engine-created child
+  // sessions. Gated by `enabled !== false` AND the client actually
+  // exposing usable `session.create`/`session.prompt` methods; the
+  // default is ON only when both hold (rollback plan: `fallback:
+  // {enabled: false}` — or an absent/partial client — restores
+  // pre-Slice-3 audit-only behavior).
+  const fallbackClientUsable =
+    client !== undefined &&
+    typeof client.session?.create === "function" &&
+    typeof client.session?.prompt === "function";
+  const fallbackEnabled = fallbackClientUsable && options?.fallback?.enabled !== false;
+  let innerAfterHook: ReturnType<typeof createAfterHook> | undefined;
+  if (quarantineEnabled) {
+    innerAfterHook = createAfterHook({
+      quarantine,
+      tracking,
+      catalog: profileCatalog,
+      ladder: DEFAULT_LADDER,
+      logger,
+      ...(client !== undefined
+        ? { fallback: { client, enabled: fallbackEnabled } }
+        : {}),
+      // Visibility: mirror the loud-advisory stderr line AND surface it
+      // on-screen. The after hook emits this ONCE per quarantine event
+      // (delete-on-consume per callID), so it is not per-call spam.
+      warnSink: (message: string) => {
+        try {
+          process.stderr.write(`${message}\n`);
+        } catch {
+          // Never let the loud-advisory warning block the hook.
+        }
+        showToastSafely(client, message, "warning");
+      },
+    });
+  }
+  const fallbackSessionIDs = innerAfterHook?.fallbackSessionIDs;
+
   const hooks: Record<string, unknown> = {
     config: async (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
       // Only clear TTL-based quarantines (rate limits); permanent quarantines
@@ -771,38 +847,22 @@ export default async function modelForecastPlugin(
         resolveCandidates: options?.resolveCandidates ?? generatedProfileResolver,
         logger,
         ...(quarantineEnabled ? { tracking } : {}),
+        ...(fallbackSessionIDs !== undefined ? { fallbackSessionIDs } : {}),
       }),
       logger,
     ),
   };
-  if (quarantineEnabled) {
-    const innerAfterHook = createAfterHook({
-      quarantine,
-      tracking,
-      catalog: profileCatalog,
-      ladder: DEFAULT_LADDER,
-      logger,
-      // Visibility: mirror the loud-advisory stderr line AND surface it
-      // on-screen. The after hook emits this ONCE per quarantine event
-      // (delete-on-consume per callID), so it is not per-call spam.
-      warnSink: (message: string) => {
-        try {
-          process.stderr.write(`${message}\n`);
-        } catch {
-          // Never let the loud-advisory warning block the hook.
-        }
-        showToastSafely(client, message, "warning");
-      },
-    });
+  if (quarantineEnabled && innerAfterHook !== undefined) {
+    const afterHook = innerAfterHook;
     // Wrap the after hook to persist permanent quarantines after every
     // quarantine event. saveToFile is idempotent and cheap — it only
     // writes entries with expiresAt === Infinity.
     hooks["tool.execute.after"] = async (
-      input: Parameters<typeof innerAfterHook>[0],
-      output: Parameters<typeof innerAfterHook>[1],
+      input: Parameters<typeof afterHook>[0],
+      output: Parameters<typeof afterHook>[1],
     ): Promise<void> => {
       const countBefore = quarantine.snapshot().length;
-      await innerAfterHook(input, output);
+      await afterHook(input, output);
       const countAfter = quarantine.snapshot().length;
       // Only save if the quarantine count changed (a new entry was added).
       if (countAfter > countBefore) {

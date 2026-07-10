@@ -54,6 +54,11 @@ import {
   type ClassifiedError,
   type ErrorType,
 } from "./error-classification.js";
+import {
+  createFallbackEngine,
+  type FallbackClient,
+  type FallbackCatalogSlice,
+} from "./fallback.js";
 import type { Logger } from "./logger.js";
 import type {
   AuditEntry,
@@ -149,6 +154,17 @@ export interface TaskHookDependencies {
   now?: () => Date;
   /** Optional logger instance for structured per-call tracing. */
   logger?: Logger;
+  /**
+   * model-fallback-error-classification (SDD change) — Slice 3, task 24.
+   * Re-entrancy guard shared with the after hook's fallback engine
+   * (design #1623 "Re-entrancy guard"). Session ids created by the
+   * fallback engine are registered here; when `input.sessionID` is a
+   * member, the before hook early-returns WITHOUT rewriting so a task
+   * call dispatched from inside a fallback session can never start a
+   * second fallback loop. Omitted when no fallback engine is wired
+   * (no re-entrancy risk to guard against).
+   */
+  fallbackSessionIDs?: ReadonlySet<string>;
 }
 
 export function toolID(tool: HookInput["tool"]): string {
@@ -383,6 +399,15 @@ export interface TrackedCall {
   originalSubagentType: string;
   targetAlias: string;
   model: string;
+  /**
+   * model-fallback-error-classification (SDD change) — Slice 3, task 24.
+   * The original task prompt text, captured so the after hook's fallback
+   * engine can re-send it verbatim to an alternate model
+   * (`client.session.prompt({..., parts:[{type:"text", text: prompt}]})`).
+   * Optional/additive: absent on trackers written before this field
+   * existed, or when the caller's `output.args.prompt` was not a string.
+   */
+  prompt?: string;
 }
 
 /**
@@ -403,6 +428,21 @@ export interface AfterHookDeps {
   warnSink?: (message: string) => void;
   now?: () => Date;
   logger?: Logger;
+  /**
+   * model-fallback-error-classification (SDD change) — Slice 3, task 24.
+   * Spec #1620 "Recursive Retry With Bounded Attempts". When present, a
+   * classified failure of a tracked `task` call triggers the bounded
+   * fallback engine (`createFallbackEngine`, `maxAttempts: 3`) instead of
+   * stopping at the single quarantine-and-audit path. `enabled` defaults
+   * to `true` when `fallback` is supplied at all — set `enabled: false`
+   * to keep the fallback dep wired (for options plumbing) while
+   * restoring pre-Slice-3 audit-only behavior (rollback plan, design
+   * #1623 "Migration / Rollout").
+   */
+  fallback?: {
+    client: FallbackClient;
+    enabled?: boolean;
+  };
 }
 
 /**
@@ -421,12 +461,30 @@ export interface QuarantineAuditEntry {
   nextViableModel: string | null;
 }
 
-export type AfterHook = (
+/**
+ * model-fallback-error-classification (SDD change) — Slice 3, task 24.
+ * `fallbackSessionIDs` is attached as a property on the returned function
+ * (not a separate return value) so `createAfterHook`'s call signature
+ * stays backward compatible with every pre-Slice-3 caller/test that does
+ * `const hook = createAfterHook(...); await hook(...)`. `plugin.ts` reads
+ * `afterHook.fallbackSessionIDs` and forwards the SAME Set instance into
+ * `createTaskHook`'s `fallbackSessionIDs` dep so both hooks share one
+ * re-entrancy guard. `undefined` when no `deps.fallback` was supplied.
+ */
+export type AfterHook = ((
   input: HookInput,
   output: { output?: unknown; metadata?: unknown },
-) => Promise<void>;
+) => Promise<void>) & {
+  fallbackSessionIDs?: Set<string>;
+};
 
-function findNextViableModel(
+/**
+ * Exported (slice 3, design #1623 "Fallback mechanism") so
+ * `src/fallback.ts` can reuse the same ladder-ordered candidate walk
+ * instead of duplicating it — the fallback engine and the after-hook's
+ * `nextViableModel` audit field MUST agree on which model is next.
+ */
+export function findNextViableModel(
   catalog: AfterHookCatalogSlice,
   originalSubagentType: string,
   quarantine: QuarantineStore,
@@ -461,8 +519,42 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
   const getNow = now ?? ((): Date => new Date());
   const emit = warnSink ?? defaultWarnSink;
 
-  return async (input, output): Promise<void> => {
+  // model-fallback-error-classification (SDD change) — Slice 3, task 24.
+  // The engine is constructed ONCE per hook (not per call) so its
+  // `fallbackSessionIDs` set persists for the lifetime of the plugin
+  // session — every child session it ever creates stays registered.
+  // `deps.fallback?.enabled` defaults to `true` when `fallback` is
+  // supplied at all (design #1623 "Migration / Rollout" rollback plan:
+  // `enabled: false` restores pre-Slice-3 audit-only behavior while
+  // keeping the client wired).
+  const fallbackClient = deps.fallback?.client;
+  const fallbackEnabled = deps.fallback !== undefined && deps.fallback.enabled !== false;
+  const fallbackEngine =
+    fallbackClient !== undefined
+      ? createFallbackEngine({
+          client: fallbackClient,
+          quarantine,
+          catalog: catalog as FallbackCatalogSlice,
+          ladder,
+          classify: classifyError,
+          maxAttempts: 3,
+          now,
+          logger,
+        })
+      : undefined;
+
+  const hook = (async (input, output): Promise<void> => {
     if (toolID(input.tool) !== "task") return;
+    // Re-entrancy guard (design #1623 "Re-entrancy guard"): a task call
+    // completing inside a session the fallback engine itself created
+    // must never re-trigger classification/quarantine/fallback.
+    if (
+      fallbackEngine !== undefined &&
+      input.sessionID !== undefined &&
+      fallbackEngine.fallbackSessionIDs.has(input.sessionID)
+    ) {
+      return;
+    }
     const callID = input.callID ?? "";
     if (callID.length === 0) return;
     const tracked = tracking.get(callID);
@@ -534,7 +626,55 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
         nextViable ?? "none"
       }`,
     );
-  };
+
+    // model-fallback-error-classification (SDD change) — Slice 3, task 24.
+    // Spec #1620 "Recursive Retry With Bounded Attempts": on a classified
+    // failure, dispatch the bounded fallback engine (up to 3 attempts
+    // TOTAL, including the attempt that just failed). Success overwrites
+    // `output.output`/`output.metadata.mfFallback`; exhaustion writes the
+    // explicit terminal error — NEVER a silent empty output.
+    if (fallbackEngine === undefined || !fallbackEnabled) return;
+
+    const result = await fallbackEngine.run({
+      sessionID: input.sessionID ?? "",
+      originalSubagentType: tracked.originalSubagentType,
+      prompt: tracked.prompt ?? "",
+      failedModel: tracked.model,
+      failureReason: reason,
+    });
+
+    const existingMetadata =
+      output.metadata !== null && typeof output.metadata === "object"
+        ? (output.metadata as Record<string, unknown>)
+        : {};
+
+    if (result.success) {
+      output.output = result.output;
+      output.metadata = {
+        ...existingMetadata,
+        mfFallback: { attempts: result.attempts, model: result.model },
+      };
+      logger?.info(
+        "createAfterHook",
+        `fallback succeeded for ${tracked.originalSubagentType} on ${result.model} after ${result.attempts} attempt(s)`,
+      );
+    } else {
+      output.output = result.output;
+      output.metadata = {
+        ...existingMetadata,
+        mfFallback: { exhausted: true, attempts: result.attempts },
+      };
+      logger?.warn(
+        "createAfterHook",
+        `fallback exhausted for ${tracked.originalSubagentType}: ${result.output}`,
+      );
+      emit(result.output);
+    }
+  }) as AfterHook;
+
+  hook.fallbackSessionIDs = fallbackEngine?.fallbackSessionIDs;
+
+  return hook;
 }
 
 function matchReason(text: string): string {
@@ -563,6 +703,16 @@ export function createTaskHook(
   return async (input, output): Promise<void> => {
     if (config.mode !== "auto") return;
     if (toolID(input.tool) !== "task") return;
+    // model-fallback-error-classification (SDD change) — Slice 3, task 24.
+    // Re-entrancy guard: a task call dispatched from inside a session the
+    // fallback engine created must never itself start a fallback loop.
+    if (
+      deps.fallbackSessionIDs !== undefined &&
+      input.sessionID !== undefined &&
+      deps.fallbackSessionIDs.has(input.sessionID)
+    ) {
+      return;
+    }
 
     const original = output.args.subagent_type;
     if (typeof original !== "string" || original.length === 0) return;
@@ -675,6 +825,7 @@ export function createTaskHook(
           originalSubagentType: original,
           targetAlias: finalDecision.subagent_type,
           model: finalDecision.model,
+          prompt: typeof output.args.prompt === "string" ? output.args.prompt : undefined,
         });
       }
     } else if (refusedReason !== null) {

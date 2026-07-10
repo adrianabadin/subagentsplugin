@@ -1334,3 +1334,227 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
     expect(tracking.has("c1")).toBe(true);
   });
 });
+
+/* -------------------------------------------------------------------------- *
+ * model-fallback-error-classification (SDD change) — Slice 3, task 23.
+ * Spec #1620 "Recursive Retry With Bounded Attempts". Design #1623
+ * "Re-entrancy guard" + "Fallback mechanism".
+ * -------------------------------------------------------------------------- */
+
+describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)", () => {
+  it("early-returns (no rewrite) when input.sessionID is already in fallbackSessionIDs", async () => {
+    const fallbackSessionIDs = new Set<string>(["fallback-child-session"]);
+    const audit = vi.fn();
+    const hook = createTaskHook(
+      {
+        mode: "auto",
+        confidenceThreshold: 0.6,
+        ladder: DEFAULT_LADDER,
+        allowlist: [],
+        denylist: [],
+      },
+      {
+        audit,
+        fallbackSessionIDs,
+        select: () => decision(),
+      },
+    );
+
+    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
+    await hook({ tool: { id: "task" }, sessionID: "fallback-child-session", callID: "c1" }, output);
+
+    expect(output.args.subagent_type).toBe("sdd-design");
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("proceeds normally when input.sessionID is NOT in fallbackSessionIDs", async () => {
+    const fallbackSessionIDs = new Set<string>(["some-other-session"]);
+    const hook = createTaskHook(
+      {
+        mode: "auto",
+        confidenceThreshold: 0.6,
+        ladder: DEFAULT_LADDER,
+        allowlist: [],
+        denylist: [],
+      },
+      {
+        fallbackSessionIDs,
+        select: () => decision(),
+      },
+    );
+
+    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
+    await hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output);
+
+    expect(output.args.subagent_type).toBe("sdd-design-alto");
+  });
+});
+
+describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24)", () => {
+  function buildTrackingWith(
+    callID: string,
+    targetAlias: string,
+    model: string,
+    original: string,
+    prompt = "do the thing",
+  ): Map<string, unknown> {
+    const m = new Map<string, unknown>();
+    m.set(callID, { originalSubagentType: original, targetAlias, model, prompt });
+    return m;
+  }
+
+  function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
+    byBase: Record<string, Array<{ modelId: string; ladderRung: LadderRung }>>;
+  } {
+    return {
+      byBase: Object.fromEntries(
+        Object.entries(byBase).map(([k, v]) => [
+          k,
+          v.map((entry) => ({ ...entry, ladderRung: "openai" as LadderRung })),
+        ]),
+      ),
+    };
+  }
+
+  it("on a classified failure with fallback enabled + client present, invokes the engine and overwrites output on success", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
+
+    const client = {
+      session: {
+        create: vi.fn(async () => ({ id: "child-1" })),
+        prompt: vi.fn(async () => ({ parts: [{ type: "text", text: "fallback success output" }] })),
+      },
+    };
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: true },
+    });
+
+    const output: { output?: unknown; metadata?: unknown } = { output: "upstream returned HTTP 429 Too Many Requests" };
+    await hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output);
+
+    expect(output.output).toBe("fallback success output");
+    expect((output.metadata as { mfFallback?: { attempts: number; model: string } })?.mfFallback).toEqual({
+      attempts: 2,
+      model: "minimax/M3",
+    });
+    // The failing model must be quarantined (existing attempt-1 path).
+    expect(quarantine.isBlocked("openai/gpt-4.1-mini")).toBe(true);
+  });
+
+  it("on exhaustion, overwrites output.output with the terminal error and sets metadata.mfFallback.exhausted", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({
+      "sdd-design": [
+        { modelId: "openai/gpt-4.1-mini" },
+        { modelId: "minimax/M3" },
+        { modelId: "google-antigravity/gemini-x" },
+      ],
+    });
+
+    const client = {
+      session: {
+        create: vi.fn(async () => ({ id: `child-${Math.random()}` })),
+        prompt: vi.fn(async () => ({ parts: [{ type: "text", text: "HTTP 429 too many requests" }] })),
+      },
+    };
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: true },
+    });
+
+    const output: { output?: unknown; metadata?: unknown } = { output: "upstream returned HTTP 429 Too Many Requests" };
+    await hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output);
+
+    expect(String(output.output)).toContain("[model-forecast] FALLBACK EXHAUSTED: 3 attempts failed for sdd-design");
+    expect((output.metadata as { mfFallback?: { exhausted: boolean; attempts: unknown[] } })?.mfFallback?.exhausted).toBe(true);
+    expect((output.metadata as { mfFallback?: { exhausted: boolean; attempts: unknown[] } })?.mfFallback?.attempts).toHaveLength(3);
+  });
+
+  it("options.fallback.enabled=false restores audit-only behavior (no engine dispatch, output untouched)", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
+
+    const create = vi.fn();
+    const prompt = vi.fn();
+    const client = { session: { create, prompt } };
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: false },
+    });
+
+    const output: { output?: unknown; metadata?: unknown } = { output: "upstream returned HTTP 429 Too Many Requests" };
+    await hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output);
+
+    expect(create).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+    expect(output.output).toBe("upstream returned HTTP 429 Too Many Requests");
+    expect(quarantine.isBlocked("openai/gpt-4.1-mini")).toBe(true);
+  });
+
+  it("without a fallback dep at all, behaves exactly like the pre-Slice-3 hook (no crash, no dispatch)", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }] });
+
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+    });
+
+    const output: { output?: unknown; metadata?: unknown } = { output: "upstream returned HTTP 429 Too Many Requests" };
+    await expect(
+      hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output),
+    ).resolves.not.toThrow();
+    expect(output.output).toBe("upstream returned HTTP 429 Too Many Requests");
+  });
+
+  it("exposes fallbackSessionIDs on the returned hook function and early-returns when input.sessionID is fallback-owned", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }] });
+
+    const client = { session: { create: vi.fn(), prompt: vi.fn() } };
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: true },
+    });
+
+    expect(hook.fallbackSessionIDs).toBeInstanceOf(Set);
+    hook.fallbackSessionIDs!.add("fallback-child");
+
+    const output: { output?: unknown } = { output: "HTTP 429" };
+    await hook({ tool: { id: "task" }, sessionID: "fallback-child", callID: "c1" }, output);
+
+    // Early-return: tracking entry must NOT have been consumed and
+    // nothing quarantined.
+    expect(tracking.has("c1")).toBe(true);
+    expect(quarantine.snapshot()).toEqual([]);
+  });
+});
