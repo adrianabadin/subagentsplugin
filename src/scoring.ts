@@ -79,6 +79,14 @@ export const PHASE_FACTOR_OVERRIDES: Readonly<
   "sdd-design": { cost: -0.25 },
   "sdd-propose": { cost: -0.25 },
   "sdd-spec": { cost: -0.25 },
+
+  // Verify/judge phases (slice 2, design #1623 "Verify exemption"): these
+  // are validation-only tasks that must pick the MOST CAPABLE available
+  // model regardless of cost — a cheaper model that misses a real defect
+  // is worse than an expensive one that catches it.
+  "sdd-verify": { cost: -0.25 },
+  "jd-judge-a": { cost: -0.25 },
+  "jd-judge-b": { cost: -0.25 },
 };
 
 /**

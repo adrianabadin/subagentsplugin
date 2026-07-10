@@ -19,7 +19,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { select } from "../src/select.js";
+import { isHardestTier, select, VERIFY_FAMILY } from "../src/select.js";
 import type {
   Effort,
   Ladder,
@@ -601,5 +601,156 @@ describe("select() — dynamic complexity scaling (PR4 ADDED)", () => {
     });
     expect(decision.action).toBe("switch");
     expect(decision.model).toBe("minimax/MiniMax-M3");
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * Slice 2 (model-fallback-error-classification, design #1623 "Verify
+ * exemption"): sdd-verify, jd-judge-a, jd-judge-b are validation-only
+ * phases. They must always pick the MOST CAPABLE available candidate
+ * (capability-first ladder ordering, anthropic rung unlocked) regardless
+ * of any other complexity signal — the escalafón/ladder rung order is
+ * used ONLY as a tie-breaker among equally-capable candidates, never as
+ * the primary cost-driven selector.
+ * -------------------------------------------------------------------------- */
+
+describe("select() — VERIFY_FAMILY set (slice 2 ADDED)", () => {
+  it("contains exactly sdd-verify, jd-judge-a, jd-judge-b", () => {
+    expect(VERIFY_FAMILY.has("sdd-verify")).toBe(true);
+    expect(VERIFY_FAMILY.has("jd-judge-a")).toBe(true);
+    expect(VERIFY_FAMILY.has("jd-judge-b")).toBe(true);
+    expect(VERIFY_FAMILY.size).toBe(3);
+  });
+
+  it("does not include unrelated phases", () => {
+    expect(VERIFY_FAMILY.has("sdd-design")).toBe(false);
+    expect(VERIFY_FAMILY.has("sdd-apply")).toBe(false);
+    expect(VERIFY_FAMILY.has("jd-fix-agent")).toBe(false);
+  });
+});
+
+describe("select() — isHardestTier() treats VERIFY_FAMILY phases as hardest tier", () => {
+  it("returns true for sdd-verify even with otherwise moderate signals", () => {
+    expect(
+      isHardestTier({
+        phase: "sdd-verify",
+        contextBreadth: "narrow",
+        diffLines: 5,
+        riskDomain: "architecture",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns true for jd-judge-a and jd-judge-b regardless of signals", () => {
+    expect(isHardestTier({ phase: "jd-judge-a", contextBreadth: "narrow" })).toBe(true);
+    expect(isHardestTier({ phase: "jd-judge-b", contextBreadth: "narrow" })).toBe(true);
+  });
+
+  it("still returns false for a moderate non-verify-family phase", () => {
+    expect(
+      isHardestTier({
+        phase: "sdd-apply",
+        contextBreadth: "narrow",
+        diffLines: 5,
+        riskDomain: "architecture",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("select() — verify picks capability over cost (spec scenario)", () => {
+  it("unlocks and selects the anthropic candidate for sdd-verify with only moderate signals", () => {
+    // Candidates where a cheaper/less-capable model (minimax) would win
+    // under plain cost-first ladder ordering. Under verify-family
+    // capability-first ordering, the runner MUST select the anthropic
+    // candidate even though context signals are otherwise moderate.
+    const candidates: SelectCandidate[] = [
+      makeCandidate({
+        subagent_type: "sdd-verify-cheap",
+        model: "minimax/MiniMax-M3",
+        confidence: 0.9,
+        ladderRung: "minimax",
+      }),
+      makeCandidate({
+        subagent_type: "sdd-verify-mid",
+        model: "openai/gpt-5.1",
+        confidence: 0.85,
+        ladderRung: "openai",
+      }),
+      makeCandidate({
+        subagent_type: "sdd-verify-alto",
+        model: "anthropic/claude-opus-4-7",
+        confidence: 0.95,
+        ladderRung: "anthropic",
+      }),
+    ];
+    const decision = select({
+      context: {
+        phase: "sdd-verify",
+        contextBreadth: "narrow",
+        diffLines: 10,
+        riskDomain: "architecture",
+      },
+      policy: DEFAULT_POLICY,
+      ladder: DEFAULT_LADDER,
+      candidates,
+    });
+    expect(decision.action).toBe("switch");
+    expect(decision.model).toBe("anthropic/claude-opus-4-7");
+  });
+
+  it("uses the ladder/rung ONLY as a tie-breaker among equally-capable jd-judge-a candidates", () => {
+    // Two candidates tied on confidence: one on anthropic, one on openai.
+    // Capability-first ordering walks the REVERSED ladder (anthropic
+    // first); since anthropic clears the threshold first, it wins the
+    // tie via rung position — proving the rung is consulted only as the
+    // tie-breaking mechanism, never as a cost-first primary driver.
+    const candidates: SelectCandidate[] = [
+      makeCandidate({
+        subagent_type: "jd-judge-a-openai",
+        model: "openai/gpt-5.1",
+        confidence: 0.9,
+        ladderRung: "openai",
+      }),
+      makeCandidate({
+        subagent_type: "jd-judge-a-anthropic",
+        model: "anthropic/claude-opus-4-7",
+        confidence: 0.9,
+        ladderRung: "anthropic",
+      }),
+    ];
+    const decision = select({
+      context: {
+        phase: "jd-judge-a",
+        contextBreadth: "narrow",
+      },
+      policy: DEFAULT_POLICY,
+      ladder: DEFAULT_LADDER,
+      candidates,
+    });
+    expect(decision.action).toBe("switch");
+    expect(decision.model).toBe("anthropic/claude-opus-4-7");
+  });
+
+  it("still respects the confidence threshold gate for verify-family phases", () => {
+    // Verify-family capability-first ordering does not bypass the
+    // threshold gate: a below-threshold anthropic candidate must NOT
+    // switch.
+    const decision = select({
+      context: {
+        phase: "sdd-verify",
+        contextBreadth: "narrow",
+      },
+      policy: DEFAULT_POLICY,
+      ladder: DEFAULT_LADDER,
+      candidates: [
+        makeCandidate({
+          model: "anthropic/claude-opus-4-7",
+          confidence: 0.2,
+          ladderRung: "anthropic",
+        }),
+      ],
+    });
+    expect(decision.action).toBe("keep-default");
   });
 });

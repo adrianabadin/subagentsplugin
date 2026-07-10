@@ -66,6 +66,21 @@ const HARDEST_TIER_RISK_DOMAINS = new Set<string>([
 ]);
 
 /**
+ * Verify/judge phase family (slice 2, design #1623 "Verify exemption").
+ * These phases are validation-only — they must always pick the MOST
+ * CAPABLE available model, independent of any other complexity signal.
+ * `context.phase` is normalized upstream by `normalizePhase` (phases.ts)
+ * before it reaches `select`, so `sdd-verify-alto` etc. arrive here
+ * already collapsed to `sdd-verify`; `jd-judge-a`/`jd-judge-b` are
+ * KNOWN_PHASES and match verbatim.
+ */
+export const VERIFY_FAMILY: ReadonlySet<string> = new Set<string>([
+  "sdd-verify",
+  "jd-judge-a",
+  "jd-judge-b",
+]);
+
+/**
  * Sentinel "no candidate cleared the bar" reason. Always contains the
  * word "threshold" so callers can grep reasoning text for the
  * skip-cases (covered by `select.test.ts`).
@@ -131,6 +146,11 @@ export function capMissingEvidence(
  * Pure. No I/O. Reads ONLY the supplied context.
  */
 export function isHardestTier(context: TaskContext): boolean {
+  // Slice 2: verify-family phases (sdd-verify, jd-judge-a, jd-judge-b)
+  // always count as hardest tier — this unlocks the anthropic rung for
+  // them independent of any other signal (spec scenario: verify picks
+  // capability over cost).
+  if (VERIFY_FAMILY.has(context.phase)) return true;
   if (context.contextBreadth === "wide") return true;
   if (
     context.diffLines !== undefined &&
@@ -265,7 +285,12 @@ export function select(input: SelectInput): SelectDecision {
   // models (like Anthropic) are checked first instead of cheapest-first.
   // This guarantees we use the best model for hard tasks and the cheapest
   // capable model for simple tasks.
+  // Slice 2: verify-family phases always use capability-first ordering —
+  // the ladder/rung is consulted ONLY as a tie-breaker among equally
+  // capable candidates (via `rankOnRung`'s confidence-desc/name-asc
+  // sort), never as the primary cost-driven selector.
   const isHighComplexity =
+    VERIFY_FAMILY.has(context.phase) ||
     context.contextBreadth === "wide" ||
     context.riskDomain === "remediation" ||
     (context.diffLines !== undefined && context.diffLines >= 1000);

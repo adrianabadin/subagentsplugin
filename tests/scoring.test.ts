@@ -289,6 +289,23 @@ describe("scoring — effectiveWeights: per-phase factor overrides", () => {
     expect(w.availability).toBeCloseTo(0.20 / 0.75, 6);
   });
 
+  // Slice 2 (model-fallback-error-classification, design #1623): verify-family
+  // phases (sdd-verify, jd-judge-a, jd-judge-b) get the SAME cost-zeroing
+  // treatment as the reasoning phases above — verification/judging tasks must
+  // not be steered toward a cheaper-but-less-capable model.
+  it("zeroes the cost factor for sdd-verify, jd-judge-a, jd-judge-b", () => {
+    for (const phase of ["sdd-verify", "jd-judge-a", "jd-judge-b"]) {
+      const w = effectiveWeights({ phase });
+      expect(w.cost, `cost should be 0 for ${phase}`).toBe(0);
+    }
+  });
+
+  it("PHASE_FACTOR_OVERRIDES pins the exact {cost: -0.25} shape for verify-family phases", () => {
+    for (const phase of ["sdd-verify", "jd-judge-a", "jd-judge-b"]) {
+      expect(PHASE_FACTOR_OVERRIDES[phase]).toEqual({ cost: -0.25 });
+    }
+  });
+
   it("scores a high-benchmark expensive model above a cheap benchmark-light one for sdd-design", () => {
     // Opus 4-7 (benchmark ~0.90, expensive) vs DeepSeek V4 Flash (benchmark
     // ~0.78, dirt cheap). With cost weight zeroed, Opus should win on sdd-design.
