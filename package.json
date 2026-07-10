@@ -1,0 +1,85 @@
+{
+  "name": "@aabadin/opencode-model-forecast",
+  "version": "0.2.0",
+  "description": "Model + effort forecast plugin for OpenCode: caches provider/model/benchmark data at startup and recommends a model per SDD phase via a CLI + orchestrator skill. Adds generated-profile routing, selection policy, and 429 fallback quarantine (60-min TTL) for auto mode.",
+  "type": "module",
+  "private": false,
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
+    },
+    "./cli": {
+      "import": "./dist/cli.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    }
+  },
+  "bin": {
+    "model-forecast": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "model-forecast",
+    "model-selection",
+    "rate-limit",
+    "fallback",
+    "ai",
+    "llm",
+    "sdd"
+  ],
+  "author": "aabadin",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aabadin/opencode-model-forecast.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aabadin/opencode-model-forecast/issues"
+  },
+  "homepage": "https://github.com/aabadin/opencode-model-forecast#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@types/node": "25.7.0",
+    "@vitest/coverage-v8": "4.1.6",
+    "tsup": "8.5.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.6"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.11"
+  },
+  "engines": {
+    "node": ">=24 <25",
+    "opencode": ">=1.17.11"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.12"
+  }
+}

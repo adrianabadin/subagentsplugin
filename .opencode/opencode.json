@@ -1,0 +1,34 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "pmc-query": {
+      "type": "local",
+      "command": [
+        "npx",
+        "--yes",
+        "--package",
+        "@aabadin/project-memory-context",
+        "pmc-query-server"
+      ],
+      "enabled": true,
+      "environment": {
+        "PMC_PROJECT_ROOT": "C:\\Users\\aabad\\Documents\\CODE\\ia\\subagentsplugin"
+      }
+    },
+    "pmc-agent-memory": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@aabadin/agent-memory-mcp"
+      ],
+      "enabled": true,
+      "environment": {
+        "MEMORY_DB_PATH": "C:\\Users\\aabad\\Documents\\CODE\\ia\\subagentsplugin\\.planning\\project-memory-context\\memory-db",
+        "EMBEDDING_MODEL": "Xenova/bge-m3",
+        "EMBEDDING_DIMENSIONS": "1024",
+        "EMBEDDING_POOLING": "cls"
+      }
+    }
+  }
+}

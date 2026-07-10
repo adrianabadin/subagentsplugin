@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+
+.env
+.env.*
+*.log
+
+.DS_Store
+.vscode/
+.idea/
+
+otros/
+
+# Generated project-context and SDD artifacts
+.planning/
+.atl/
+.sdd/
+graphify-out/

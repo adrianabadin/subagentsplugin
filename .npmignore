@@ -1,0 +1,37 @@
+# Source files (we ship the built dist/ instead)
+src/
+tests/
+coverage/
+
+# Local OpenCode runtime config (NOT for distribution)
+.opencode/
+otros/
+
+# PMC artifacts (project memory context)
+.planning/
+
+# Build / test configuration
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+.editorconfig
+
+# Tooling bookkeeping
+.gitignore
+.npmignore
+.git/
+.github/
+
+# Local environment
+.env
+.env.*
+!.env.example
+*.log
+*.tgz
+.DS_Store
+.vscode/
+.idea/
+
+# Docs drafts (README.md and LICENSE are kept)
+docs/
+PUBLISHING.md

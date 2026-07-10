@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "agent-memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@aabadin/agent-memory-mcp"
+      ],
+      "env": {
+        "MEMORY_DB_PATH": "C:\\Users\\aabad\\Documents\\CODE\\ia\\subagentsplugin\\.planning\\project-memory-context\\memory-db",
+        "EMBEDDING_MODEL": "Xenova/bge-m3",
+        "EMBEDDING_DIMENSIONS": "1024",
+        "EMBEDDING_POOLING": "cls"
+      }
+    },
+    "pmc-query": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "@aabadin/project-memory-context",
+        "pmc-query-server"
+      ],
+      "env": {
+        "PMC_PROJECT_ROOT": "C:\\Users\\aabad\\Documents\\CODE\\ia\\subagentsplugin"
+      }
+    }
+  }
+}
