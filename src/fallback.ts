@@ -5,59 +5,104 @@
  * ADDED requirements). Design #1623 "Fallback mechanism" +
  * "Re-entrancy guard" + "Client wiring".
  *
+ * PR-03 (supervised-model-fallback-recovery) "Deterministic hardening
+ * of createFallbackEngine" replaces the boolean result shape with a
+ * structured `FallbackResult` union (success / exhausted / cancelled),
+ * extends `FallbackAttempt` with sequence/provider/timestamps, applies
+ * the design §12 provider-diversity preference (amendment P-03),
+ * enforces deadlines on `session.create` (INV-004), and tombstones
+ * created sessions for five minutes after they leave the active set
+ * (INV-010 + amendment R-01 follow-ups).
+ *
  * `createFallbackEngine` runs the bounded retry loop: on a classified
  * failure of a tracked `task` call, find the next viable non-quarantined
  * model, re-prompt it via the OpenCode SDK client (`session.create` +
- * `session.prompt`), classify the new result, and either return success
- * (caller overwrites `output.output`/`output.metadata`) or continue to the
- * next attempt. Stops after EXACTLY `maxAttempts` total attempts
+ * `session.prompt`), classify the new result via `classifySdkResult`
+ * (design §8 with amendments C-06 and P-01), and either return success
+ * (caller overwrites `output.output`/`output.metadata`) or continue to
+ * the next attempt. Stops after EXACTLY `maxAttempts` total attempts
  * (including the attempt that triggered the call into this engine) and
  * surfaces a structured terminal error on exhaustion — NEVER a silent
  * empty output.
  *
  * Re-entrancy: every child session the engine creates is registered in
- * `fallbackSessionIDs` BEFORE `session.prompt` is called, so nested
- * `tool.execute.before` / `tool.execute.after` hooks firing for that
- * session (because the fallback session itself dispatches a `task` tool
- * call) can early-return. Combined with the hard `maxAttempts` cap, this
- * makes runaway recursive fallback loops structurally impossible.
+ * `fallbackSessionIDs` (active set) BEFORE `session.prompt` is called
+ * and moved to `tombstoneSessionIDs` (with a five-minute TTL) when its
+ * prompt resolves. Nested `tool.execute.before` / `tool.execute.after`
+ * hooks firing for that session can early-return. Late events that
+ * arrive after the tombstone window expires are no longer recognised
+ * as fallback-owned.
  *
- * Client shape is intentionally loose/structural (design #1623 "Client
- * wiring" — no SDK type import). `client.session.create` /
- * `client.session.prompt` are both optional; when either is missing the
- * engine degrades gracefully (treats the loop as immediately exhausted
- * after the one attempt the caller already reports) instead of throwing.
+ * The cancelled variant of `FallbackResult` is declared for forward
+ * compatibility with PR-07's cancellation handling; the engine does not
+ * emit it in PR-03 because the event hook arrives in PR-05.
  */
 
-import { type QuarantineErrorType, type QuarantineStore } from "./quarantine.js";
-import type { ClassifiedError } from "./error-classification.js";
+import type { QuarantineErrorType, QuarantineStore } from "./quarantine.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
+import {
+  classifySdkResult,
+  type AttemptOutcome,
+} from "./attempt-outcome.js";
+import { withDeadline, DeadlineError } from "./async-deadline.js";
+import {
+  DEFAULT_RATE_LIMIT_TTL_MS,
+  MAX_TOTAL_ATTEMPTS,
+  SESSION_CREATE_TIMEOUT_MS,
+} from "./recovery-policy.js";
 import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
+import { providerOf } from "./model-groups.js";
 
-/** A single fallback attempt record (used both mid-loop and in the terminal error). */
+/** A single fallback attempt record (used both mid-loop and in the terminal result). */
 export interface FallbackAttempt {
+  /** 1-indexed ordinal position. INV-002 caps the total at three. */
+  sequence: 1 | 2 | 3;
   model: string;
+  /**
+   * Provider segment extracted via `providerOf` (design §12.2 +
+   * amendment C-04). Lower-cased. Empty string when the model id has
+   * no extractable provider — such models are discarded, never
+   * attempted.
+   */
+  provider: string;
+  /**
+   * Reason for the attempt's terminal state. Mirrors
+   * `AttemptFailureKind` for failures and a `"success"` / `"empty_output"` /
+   * `"malformed_response"` literal for non-failure outcomes.
+   */
   reason: string;
+  /** Wall-clock millisecond timestamp when the engine began this attempt. */
+  startedAt: number;
+  /** Wall-clock millisecond timestamp when this attempt settled (success or failure). */
+  finishedAt: number;
 }
 
 export interface FallbackSuccessResult {
-  success: true;
+  status: "success";
   output: string;
   model: string;
-  /** Total attempts consumed, INCLUDING the one that triggered the call (1-indexed). */
-  attempts: number;
-}
-
-export interface FallbackExhaustedResult {
-  success: false;
-  /** The formatted "[model-forecast] FALLBACK EXHAUSTED: ..." terminal error string. */
-  output: string;
+  /** Every attempt actually run, INCLUDING the original failed one (sequence 1) and the winning fallback. */
   attempts: FallbackAttempt[];
 }
 
-export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult;
+export interface FallbackExhaustedResult {
+  status: "exhausted";
+  /** The "[model-forecast] FALLBACK EXHAUSTED: …" terminal output. ALWAYS non-empty (§18 invariant). */
+  output: string;
+  /** Every attempt actually run (may be shorter than `maxAttempts` if no viable candidate remains). */
+  attempts: FallbackAttempt[];
+}
+
+export interface FallbackCancelledResult {
+  status: "cancelled";
+  reason: "user_cancelled" | "parent_cancelled";
+  /** Attempts that ran before cancellation was observed. */
+  attempts: FallbackAttempt[];
+}
+
+export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult | FallbackCancelledResult;
 
 /**
  * Structural shape of the OpenCode SDK client surface that the engine needs.
@@ -81,9 +126,15 @@ export interface FallbackEngineDeps {
   quarantine: QuarantineStore;
   catalog: FallbackCatalogSlice;
   ladder: readonly LadderRung[];
-  classify: (text: string) => ClassifiedError | null;
-  /** Hard cap on TOTAL attempts (including the one that triggered the call). Design mandates exactly 3 in production. */
-  maxAttempts: number;
+  /**
+   * @deprecated Use `classify` injected below. Kept for backward
+   * compatibility with existing tests that pre-date PR-03.
+   */
+  classify: (text: string) => null | { type: string; code: string; rawExcerpt?: string };
+  /** Hard cap on TOTAL attempts (including the one that triggered the call). Default: `MAX_TOTAL_ATTEMPTS`. */
+  maxAttempts?: number;
+  /** Override the deadline applied to `session.create` (default: `SESSION_CREATE_TIMEOUT_MS`). */
+  sessionCreateTimeoutMs?: number;
   now?: () => Date;
   logger?: Logger;
 }
@@ -102,8 +153,10 @@ export interface FallbackRunParams {
 }
 
 export interface FallbackEngine {
-  /** Session ids created by this engine — shared re-entrancy guard for before/after hooks. */
+  /** Session ids currently being prompted — shared re-entrancy guard for before/after hooks. */
   fallbackSessionIDs: Set<string>;
+  /** Session ids whose prompt has settled, kept for late-event rejection (INV-010). Cleared after TTL. */
+  tombstoneSessionIDs: Set<string>;
   run: (params: FallbackRunParams) => Promise<FallbackResult>;
 }
 
@@ -124,34 +177,40 @@ function extractSessionId(created: unknown): string | undefined {
   return undefined;
 }
 
-function joinTextParts(result: unknown): string {
-  if (result === null || typeof result !== "object") return "";
-  const parts = (result as { parts?: unknown }).parts;
-  if (!Array.isArray(parts)) return "";
-  return parts
-    .filter(
-      (part): part is { type: string; text: string } =>
-        part !== null &&
-        typeof part === "object" &&
-        (part as { type?: unknown }).type === "text" &&
-        typeof (part as { text?: unknown }).text === "string",
-    )
-    .map((part) => part.text)
-    .join("");
-}
-
+/**
+ * §12.2 provider extraction — amendment C-04 mandates this single
+ * definition. A model without a slash returns "" and is discarded
+ * (never entered into the candidates list).
+ */
 function splitModelId(modelId: string): { providerID: string; modelID: string } {
   const slash = modelId.indexOf("/");
   if (slash <= 0) return { providerID: "", modelID: modelId };
   return { providerID: modelId.slice(0, slash), modelID: modelId.slice(slash + 1) };
 }
 
+function providerFor(modelId: string): string {
+  return providerOf(modelId);
+}
+
+function nowMs(now: () => Date): number {
+  return now().getTime();
+}
+
+function isProviderErrorKind(reason: string): boolean {
+  return reason === "provider_error";
+}
+
 /**
- * Finds the next viable (non-quarantined, not-already-attempted-this-run)
- * candidate for `originalSubagentType`, walking the ladder cheapest-first
- * — same algorithm as `hooks.ts`'s `findNextViableModel`, extended with an
- * `excludeModels` set so the engine never re-dispatches a model it already
- * attempted in this run (defense-in-depth on top of quarantine).
+ * Find the next viable candidate with provider-diversity preference.
+ *
+ * §12.1 + amendment P-03: between candidates, PREFER providers not yet
+ * attempted in this run. Reuse a previously-attempted provider only
+ * when (a) no other-provider candidate exists AND (b) the prior
+ * attempt of that provider did not return `provider_error`.
+ *
+ * @param excludeModels  Models already attempted (quarantine-excluded by the caller).
+ * @param attemptedProviders Providers that have already been attempted this run.
+ * @param providerHadError Providers whose previous attempt returned provider_error.
  */
 function findNextViableModel(
   catalog: FallbackCatalogSlice,
@@ -159,51 +218,144 @@ function findNextViableModel(
   quarantine: QuarantineStore,
   ladder: readonly LadderRung[],
   excludeModels: ReadonlySet<string>,
+  attemptedProviders: ReadonlySet<string>,
+  providerHadError: ReadonlySet<string>,
 ): string | null {
   const candidates = catalog.byBase[originalSubagentType] ?? [];
-  const byRung = new Map<LadderRung, string[]>();
+  // Bucket candidates by rung AND by (provider, error-free) status so
+  // we can satisfy P-03 in a single ladder walk.
+  type Bucket = { rung: LadderRung; modelIds: string[] };
+  const freshByRung = new Map<LadderRung, string[]>();
+  const reuseByRung = new Map<LadderRung, string[]>();
   for (const candidate of candidates) {
     const rung = candidate.ladderRung;
     if (rung === undefined) continue;
-    const list = byRung.get(rung) ?? [];
-    list.push(candidate.modelId);
-    byRung.set(rung, list);
+    const modelId = candidate.modelId;
+    if (excludeModels.has(modelId)) continue;
+    if (quarantine.isBlocked(modelId)) continue;
+    const provider = providerFor(modelId);
+    // Discard models without extractable provider (C-04).
+    if (provider.length === 0) continue;
+    const fresh = !attemptedProviders.has(provider);
+    const reusable =
+      !fresh &&
+      attemptedProviders.has(provider) &&
+      !providerHadError.has(provider);
+    if (!fresh && !reusable) continue;
+    const target = fresh ? freshByRung : reuseByRung;
+    const list = target.get(rung) ?? [];
+    list.push(modelId);
+    target.set(rung, list);
+  }
+  // Walk the ladder first against fresh-provider candidates; fall back
+  // to same-provider candidates only when no fresh candidate remains.
+  for (const rung of ladder) {
+    const fresh = freshByRung.get(rung);
+    if (fresh !== undefined && fresh.length > 0) return fresh[0];
   }
   for (const rung of ladder) {
-    const models = byRung.get(rung);
-    if (models === undefined) continue;
-    for (const modelId of models) {
-      if (excludeModels.has(modelId)) continue;
-      if (quarantine.isBlocked(modelId)) continue;
-      return modelId;
-    }
+    const reuse = reuseByRung.get(rung);
+    if (reuse !== undefined && reuse.length > 0) return reuse[0];
   }
   return null;
 }
 
 /**
- * Formats the terminal "FALLBACK EXHAUSTED" error. Matches design #1623's
- * exact message shape for the canonical 3-attempt case:
- *
- *   [model-forecast] FALLBACK EXHAUSTED: 3 attempts failed for <base>.
- *   Attempts: m1(reason), m2(reason), m3(reason). Manual action required.
- *
- * Generalizes the attempt count so the "all candidates quarantined at
- * dispatch" scenario (which may terminate with fewer than `maxAttempts`
- * recorded attempts) still produces a well-formed, non-empty message.
+ * Formats the terminal "FALLBACK EXHAUSTED" error. §18 mandates the
+ * non-empty invariant: this function is the only producer of the
+ * `output` field on `FallbackExhaustedResult` and is REQUIRED to
+ * always yield a string of length > 0 (the design gate forbids the
+ * empty-string → success branch from ever being reachable).
  */
 function formatExhausted(base: string, attempts: readonly FallbackAttempt[]): string {
   const list = attempts.map((attempt) => `${attempt.model}(${attempt.reason})`).join(", ");
   return `[model-forecast] FALLBACK EXHAUSTED: ${attempts.length} attempts failed for ${base}. Attempts: ${list}. Manual action required.`;
 }
 
+/**
+ * Tombstone duration for a created session id once its prompt has
+ * settled. Five minutes per design §21 PR-03 item 12 (and matches the
+ * `COMPLETED_TASK_TOMBSTONE_MS` constant already exposed in
+ * `recovery-policy.ts`).
+ */
+const TOMBSTONE_TTL_MS = 5 * 60 * 1_000;
+
+function scheduleTombstoneEviction(
+  sessionId: string,
+  tombstones: Set<string>,
+  nowFn: () => Date,
+): void {
+  const timer = setTimeout(() => {
+    tombstones.delete(sessionId);
+  }, TOMBSTONE_TTL_MS);
+  timer.unref?.();
+  // nowFn is consumed only to anchor the eviction decision if needed in
+  // future (e.g. for fake-clock injection); mark it referenced to keep
+  // the parameter live without forcing a no-op call.
+  void nowFn;
+}
+
+function reasonForOutcome(outcome: AttemptOutcome): string {
+  if (outcome.kind === "success") return "success";
+  return outcome.reason;
+}
+
 export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
-  const { quarantine, catalog, ladder, classify, logger } = deps;
-  const maxAttempts = deps.maxAttempts;
+  const { quarantine, catalog, ladder, logger } = deps;
+  const maxAttempts = deps.maxAttempts ?? MAX_TOTAL_ATTEMPTS;
+  const sessionCreateTimeoutMs = deps.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
+  const nowFn = deps.now ?? ((): Date => new Date());
   const fallbackSessionIDs = new Set<string>();
+  const tombstoneSessionIDs = new Set<string>();
+  const attemptedProviders = new Set<string>();
+  const providerHadError = new Set<string>();
+
+  function tombstone(sessionId: string): void {
+    fallbackSessionIDs.delete(sessionId);
+    tombstoneSessionIDs.add(sessionId);
+    scheduleTombstoneEviction(sessionId, tombstoneSessionIDs, nowFn);
+  }
+
+  function quarantineFailure(outcome: AttemptOutcome, model: string, fallbackReason: string, rawText: string): void {
+    if (outcome.kind !== "failure") return;
+    const reason = outcome.code;
+    const reasonKind = outcome.reason;
+    if (reasonKind === "rate_limit") {
+      const ttlMs = resolveRateLimitTtlMs(
+        [{ source: "text", value: rawText }],
+        Date.now(),
+      );
+      // resolveRateLimitTtlMs returns DEFAULT_RATE_LIMIT_TTL_MS when no hint is found.
+      quarantine.addAutomaticRateLimit(model, reason, ttlMs);
+    } else if (reasonKind === "model_not_configured") {
+      quarantine.addAutomaticExactModel(model, reason, "model_not_configured");
+    } else if (reasonKind === "provider_error") {
+      const provider = providerFor(model);
+      quarantine.addAutomaticProvider(provider, reason, "provider_error");
+    } else {
+      // empty_output / malformed_response / unknown_retryable / etc.:
+      // no global quarantine (design §10.4 / §10.5). The candidate is
+      // excluded from THIS recovery only (already handled by the
+      // excludeModels set).
+      logger?.info(
+        "fallback",
+        `non-quarantining failure for ${model}: ${reasonKind} (${fallbackReason})`,
+      );
+    }
+  }
 
   async function run(params: FallbackRunParams): Promise<FallbackResult> {
-    const attempts: FallbackAttempt[] = [{ model: params.failedModel, reason: params.failureReason }];
+    const startedAt0 = nowMs(nowFn);
+    const originalProvider = providerFor(params.failedModel);
+    if (originalProvider.length > 0) attemptedProviders.add(originalProvider);
+    const attempts: FallbackAttempt[] = [{
+      sequence: 1,
+      model: params.failedModel,
+      provider: originalProvider,
+      reason: params.failureReason,
+      startedAt: startedAt0,
+      finishedAt: startedAt0,
+    }];
     const attemptedModels = new Set<string>([params.failedModel]);
 
     const sessionApi = deps.client?.session;
@@ -212,34 +364,76 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
     while (attempts.length < maxAttempts) {
       if (!canDispatch) break;
 
-      const nextModel = findNextViableModel(catalog, params.originalSubagentType, quarantine, ladder, attemptedModels);
+      const nextModel = findNextViableModel(
+        catalog,
+        params.originalSubagentType,
+        quarantine,
+        ladder,
+        attemptedModels,
+        attemptedProviders,
+        providerHadError,
+      );
       if (nextModel === null) {
-        logger?.info("fallback", `no viable candidate remains for ${params.originalSubagentType} after ${attempts.length} attempt(s); terminating`);
+        logger?.info(
+          "fallback",
+          `no viable candidate remains for ${params.originalSubagentType} after ${attempts.length} attempt(s); terminating`,
+        );
         break;
       }
       attemptedModels.add(nextModel);
 
+      const nextProvider = providerFor(nextModel);
+      if (nextProvider.length > 0) attemptedProviders.add(nextProvider);
+
+      const attemptStartedAt = nowMs(nowFn);
       let sessionId: string | undefined;
+
       try {
-        const created = await Promise.resolve(
-          sessionApi!.create!({
-            body: {
-              parentID: params.sessionID,
-              title: `model-forecast fallback attempt ${attempts.length + 1} (${nextModel})`,
-            },
-          }),
+        const created = await withDeadline(
+          "session.create",
+          sessionCreateTimeoutMs,
+          () =>
+            Promise.resolve(
+              sessionApi!.create!({
+                body: {
+                  parentID: params.sessionID,
+                  title: `model-forecast fallback attempt ${attempts.length + 1} (${nextModel})`,
+                },
+              }),
+            ),
         );
         sessionId = extractSessionId(created);
       } catch (err) {
-        const reason = err instanceof Error ? err.message : "session_create_failed";
+        const finishedAt = nowMs(nowFn);
+        const reason =
+          err instanceof DeadlineError
+            ? "session_create_timeout"
+            : err instanceof Error
+              ? err.message
+              : "session_create_failed";
         logger?.warn("fallback", `session.create threw for ${nextModel}: ${reason}`);
-        attempts.push({ model: nextModel, reason: "session_create_failed" });
+        attempts.push({
+          sequence: (attempts.length + 1) as 1 | 2 | 3,
+          model: nextModel,
+          provider: nextProvider,
+          reason,
+          startedAt: attemptStartedAt,
+          finishedAt,
+        });
         continue;
       }
 
       if (sessionId === undefined) {
+        const finishedAt = nowMs(nowFn);
         logger?.warn("fallback", `session.create for ${nextModel} did not return a usable session id`);
-        attempts.push({ model: nextModel, reason: "session_create_failed" });
+        attempts.push({
+          sequence: (attempts.length + 1) as 1 | 2 | 3,
+          model: nextModel,
+          provider: nextProvider,
+          reason: "session_create_failed",
+          startedAt: attemptStartedAt,
+          finishedAt,
+        });
         continue;
       }
 
@@ -264,45 +458,94 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
           }),
         );
       } catch (err) {
-        const reason = err instanceof Error ? err.message : "prompt_failed";
+        const finishedAt = nowMs(nowFn);
+        const reason = err instanceof Error ? err.message : "session_prompt_failed";
         logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
-        attempts.push({ model: nextModel, reason });
+        attempts.push({
+          sequence: (attempts.length + 1) as 1 | 2 | 3,
+          model: nextModel,
+          provider: nextProvider,
+          reason,
+          startedAt: attemptStartedAt,
+          finishedAt,
+        });
+        // Tombstone this session: prompt failed but session id still
+        // exists. Move it from active to tombstone.
+        tombstone(sessionId);
         continue;
       }
 
-      const text = joinTextParts(promptResult);
-      const classified = classify(text);
+      const outcome = classifySdkResult(promptResult);
+      const finishedAt = nowMs(nowFn);
 
-      if (classified === null || classified.type === "other") {
-        // No known error pattern matched — success.
-        logger?.info("fallback", `attempt ${attempts.length + 1} succeeded on ${nextModel}`);
-        return { success: true, output: text, model: nextModel, attempts: attempts.length + 1 };
+      if (outcome.kind === "success") {
+        logger?.info(
+          "fallback",
+          `attempt ${attempts.length + 1} succeeded on ${nextModel}`,
+        );
+        attempts.push({
+          sequence: (attempts.length + 1) as 1 | 2 | 3,
+          model: nextModel,
+          provider: nextProvider,
+          reason: reasonForOutcome(outcome),
+          startedAt: attemptStartedAt,
+          finishedAt,
+        });
+        tombstone(sessionId);
+        return {
+          status: "success",
+          output: outcome.text,
+          model: nextModel,
+          attempts,
+        };
       }
 
-      const errorType = classified.type as QuarantineErrorType;
-      if (errorType === "rate_limit") {
-        quarantine.addAutomaticRateLimit(
-          nextModel,
-          classified.code,
-          resolveRateLimitTtlMs([{ source: "text", value: text }], Date.now()),
-        );
-      } else if (errorType === "model_not_configured") {
-        quarantine.addAutomaticExactModel(nextModel, classified.code, errorType);
-      } else {
-        quarantine.addAutomaticProvider(
-          nextModel.split("/", 1)[0] ?? "",
-          classified.code,
-          errorType as "provider_error",
-        );
+      // outcome.kind === "failure"
+      const rawText = typeof outcome.rawExcerpt === "string" ? outcome.rawExcerpt : "";
+      const reasonLabel = reasonForOutcome(outcome);
+
+      // Provider-error bookkeeping for diversity preference (P-03).
+      if (isProviderErrorKind(reasonLabel) && nextProvider.length > 0) {
+        providerHadError.add(nextProvider);
       }
-      logger?.info("fallback", `attempt ${attempts.length + 1} failed on ${nextModel} (${classified.code}); quarantined`);
-      attempts.push({ model: nextModel, reason: classified.code });
+
+      quarantineFailure(outcome, nextModel, reasonLabel, rawText);
+
+      logger?.info(
+        "fallback",
+        `attempt ${attempts.length + 1} failed on ${nextModel} (${reasonLabel}); ${
+          reasonLabel === "rate_limit" || reasonLabel === "model_not_configured" || reasonLabel === "provider_error"
+            ? "quarantined"
+            : "excluded from this recovery only"
+        }`,
+      );
+      attempts.push({
+        sequence: (attempts.length + 1) as 1 | 2 | 3,
+        model: nextModel,
+        provider: nextProvider,
+        reason: reasonLabel,
+        startedAt: attemptStartedAt,
+        finishedAt,
+      });
+      tombstone(sessionId);
     }
 
     const output = formatExhausted(params.originalSubagentType, attempts);
     logger?.warn("fallback", output);
-    return { success: false, output, attempts };
+    // Defensive: design §18 invariant — exhausted output is never empty.
+    if (output.length === 0) {
+      // This branch is unreachable under the current formatExhausted
+      // implementation, but the §18 gate requires it be guarded.
+      throw new Error("[model-forecast] internal invariant: exhausted output is empty");
+    }
+    return { status: "exhausted", output, attempts };
   }
 
-  return { fallbackSessionIDs, run };
+  return { fallbackSessionIDs, tombstoneSessionIDs, run };
 }
+
+/**
+ * Re-exported so callers (and tests) don't have to import the quarantine
+ * module directly just to spell the discriminated union's string variants.
+ */
+export type { QuarantineErrorType };

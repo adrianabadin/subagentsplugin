@@ -663,17 +663,22 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
         ? (output.metadata as Record<string, unknown>)
         : {};
 
-    if (result.success) {
+    if (result.status === "success") {
       output.output = result.output;
+      // PR-03: `result.attempts` is now the full FallbackAttempt list
+      // (sequence/model/provider/reason/timestamps). The metadata keeps
+      // the COUNT semantic for backward compat with downstream consumers
+      // that only need the cardinality; PR-08 will switch this to the
+      // array form per design §19.2 (`modelForecast.attempts`).
       output.metadata = {
         ...existingMetadata,
-        mfFallback: { attempts: result.attempts, model: result.model },
+        mfFallback: { attempts: result.attempts.length, model: result.model },
       };
       logger?.info(
         "createAfterHook",
-        `fallback succeeded for ${tracked.originalSubagentType} on ${result.model} after ${result.attempts} attempt(s)`,
+        `fallback succeeded for ${tracked.originalSubagentType} on ${result.model} after ${result.attempts.length} attempt(s)`,
       );
-    } else {
+    } else if (result.status === "exhausted") {
       output.output = result.output;
       output.metadata = {
         ...existingMetadata,
@@ -684,6 +689,16 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
         `fallback exhausted for ${tracked.originalSubagentType}: ${result.output}`,
       );
       emit(result.output);
+    } else {
+      // result.status === "cancelled" — declared in PR-03's
+      // FallbackResult union but the engine does not produce it in
+      // this PR (event hook arrives in PR-05, cancellation handling in
+      // PR-07). When wired up later this branch will leave the
+      // metadata untouched per INV-006 ("Cancelación humana gana").
+      logger?.info(
+        "createAfterHook",
+        `fallback cancelled for ${tracked.originalSubagentType}: ${result.reason}`,
+      );
     }
   }) as AfterHook;
 

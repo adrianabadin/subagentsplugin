@@ -6,6 +6,12 @@
  * "Re-entrancy guard". Uses a FAKE structural client (`session.create` /
  * `session.prompt` stubs) — never a real SDK — plus an injected `now`
  * clock via `QuarantineStore`'s own seam.
+ *
+ * PR-03 (supervised-model-fallback-recovery) updated this file to
+ * pin the new discriminated `FallbackResult` shape (`status:
+ * "success" | "exhausted" | "cancelled"`) and the extended
+ * `FallbackAttempt` shape (sequence, model, provider, reason,
+ * startedAt, finishedAt).
  */
 import { describe, expect, it, vi } from "vitest";
 import { createFallbackEngine, type FallbackCatalogSlice, type FallbackClient } from "../src/fallback.js";
@@ -73,17 +79,16 @@ describe("createFallbackEngine()", () => {
       failureReason: "HTTP 429",
     });
 
-    expect(result.success).toBe(true);
-    if (result.success) {
+    expect(result.status).toBe("success");
+    if (result.status === "success") {
       expect(result.model).toBe("minimax/M3");
       expect(result.output).toBe("task completed successfully");
-      expect(result.attempts).toBe(2);
+      // The full attempts list is carried on success (PR-03 shape change).
+      expect(result.attempts).toHaveLength(2);
+      expect(result.attempts[0]?.model).toBe("openai/gpt-4.1-mini");
+      expect(result.attempts[1]?.model).toBe("minimax/M3");
     }
 
-    // The failing model must be quarantined per its error type (rate_limit
-    // is quarantined by the caller BEFORE run() is invoked in production;
-    // here we assert the engine did NOT itself re-quarantine the model it
-    // was told already failed).
     expect(created).toEqual([{ parentID: "parent-session" }]);
     expect(prompted).toHaveLength(1);
     expect(prompted[0]?.providerID).toBe("minimax");
@@ -92,8 +97,9 @@ describe("createFallbackEngine()", () => {
     expect(prompted[0]?.text).toBe("do the thing");
 
     // Re-entrancy: the child session created by the engine must be
-    // registered in fallbackSessionIDs.
-    expect(engine.fallbackSessionIDs.has("child-session-1")).toBe(true);
+    // tombstoned (no longer active) after the prompt settled.
+    expect(engine.fallbackSessionIDs.has("child-session-1")).toBe(false);
+    expect(engine.tombstoneSessionIDs.has("child-session-1")).toBe(true);
   });
 
   it("exhaustion after exactly 3 attempts surfaces a structured terminal error naming all attempted models + reasons", async () => {
@@ -131,17 +137,24 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
+    expect(result.status).toBe("exhausted");
+    if (result.status === "exhausted") {
       expect(result.attempts).toHaveLength(3);
-      expect(result.attempts[0]).toEqual({ model: "openai/gpt-4.1-mini", reason: "429" });
+      expect(result.attempts[0]?.model).toBe("openai/gpt-4.1-mini");
+      expect(result.attempts[0]?.reason).toBe("429");
       expect(result.attempts[1]?.model).toBe("minimax/M3");
       expect(result.attempts[2]?.model).toBe("google-antigravity/gemini-x");
+      // PR-03: each attempt now carries the provider segment.
+      expect(result.attempts[0]?.provider).toBe("openai");
+      expect(result.attempts[1]?.provider).toBe("minimax");
+      expect(result.attempts[2]?.provider).toBe("google-antigravity");
       expect(result.output).toBe(
         "[model-forecast] FALLBACK EXHAUSTED: 3 attempts failed for sdd-design. " +
           `Attempts: openai/gpt-4.1-mini(429), ${result.attempts[1]?.model}(${result.attempts[1]?.reason}), ` +
           `${result.attempts[2]?.model}(${result.attempts[2]?.reason}). Manual action required.`,
       );
+      // §18 invariant — output is always non-empty.
+      expect(result.output.length).toBeGreaterThan(0);
     }
   });
 
@@ -173,11 +186,13 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(result.success).toBe(false);
+    expect(result.status).toBe("exhausted");
     expect(create).not.toHaveBeenCalled();
     expect(prompt).not.toHaveBeenCalled();
-    if (!result.success) {
+    if (result.status === "exhausted") {
       expect(result.attempts).toHaveLength(1);
+      expect(result.attempts[0]?.model).toBe("openai/gpt-4.1-mini");
+      expect(result.attempts[0]?.reason).toBe("429");
     }
   });
 
@@ -217,29 +232,30 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(result.success).toBe(false);
+    expect(result.status).toBe("exhausted");
     // 3 total attempts recorded (1 initial + 2 by the engine); the 4th
     // catalog member (glm-5.2) was never dispatched.
     expect(client.session?.create).toHaveBeenCalledTimes(2);
-    if (!result.success) {
+    if (result.status === "exhausted") {
       expect(result.attempts).toHaveLength(3);
       expect(result.attempts.some((a) => a.model === "glm-5.2/glm-x")).toBe(false);
     }
   });
 
-  it("re-entrancy: a fallback session's own prompt does not start a second fallback loop (fallbackSessionIDs guard is populated before prompting)", async () => {
+  it("re-entrancy: a fallback session's own prompt registers BEFORE prompting so nested hooks early-return", async () => {
     const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
     const catalog = makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] });
 
-    let capturedSessionIdAtPromptTime: string | undefined;
+    let activeAtPromptTime: boolean | undefined;
     const client: FallbackClient = {
       session: {
         create: vi.fn(async () => ({ id: "child-session-1" })),
         prompt: vi.fn(async (opts: { path: { id: string } }) => {
           // At the moment prompt() fires, the session must ALREADY be
-          // registered in fallbackSessionIDs — this is what lets a
-          // nested before/after hook on this same sessionID bail out.
-          capturedSessionIdAtPromptTime = opts.path.id;
+          // registered in fallbackSessionIDs (the active re-entrancy
+          // guard). After the prompt resolves it moves to
+          // tombstoneSessionIDs.
+          activeAtPromptTime = engine.fallbackSessionIDs.has(opts.path.id);
           return { parts: [{ type: "text", text: "ok" }] };
         }),
       },
@@ -262,8 +278,7 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(capturedSessionIdAtPromptTime).toBe("child-session-1");
-    expect(engine.fallbackSessionIDs.has("child-session-1")).toBe(true);
+    expect(activeAtPromptTime).toBe(true);
   });
 
   it("maxAttempts is an explicit hard-cap parameter, not implicit: maxAttempts=1 makes zero fallback attempts", async () => {
@@ -291,9 +306,9 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(result.success).toBe(false);
+    expect(result.status).toBe("exhausted");
     expect(create).not.toHaveBeenCalled();
-    if (!result.success) expect(result.attempts).toHaveLength(1);
+    if (result.status === "exhausted") expect(result.attempts).toHaveLength(1);
   });
 
   it("gracefully no-ops (does not crash) when the client has no session methods", async () => {
@@ -317,7 +332,7 @@ describe("createFallbackEngine()", () => {
       failureReason: "429",
     });
 
-    expect(result.success).toBe(false);
-    if (!result.success) expect(result.attempts).toHaveLength(1);
+    expect(result.status).toBe("exhausted");
+    if (result.status === "exhausted") expect(result.attempts).toHaveLength(1);
   });
 });
