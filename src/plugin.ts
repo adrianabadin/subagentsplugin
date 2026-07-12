@@ -79,6 +79,8 @@ let inflightRefresh: { key: string; promise: Promise<void> } | null = null;
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export type PluginInput = Record<string, unknown>;
 
+import type { OpenCodeSessionClient } from "./opencode-client.js";
+
 /**
  * Optional OpenCode-style client. When supplied, `refreshCache` calls
  * `client.provider.list()` synchronously or asynchronously and merges
@@ -118,19 +120,7 @@ export interface PluginClient {
    * optional — no SDK type import — so a client missing either method
    * degrades the fallback engine to a graceful no-op instead of a crash.
    */
-  session?: {
-    create?: (opts: {
-      body: { parentID?: string; title?: string };
-    }) => Promise<unknown> | unknown;
-    prompt?: (opts: {
-      path: { id: string };
-      body: {
-        model: { providerID: string; modelID: string };
-        agent: string;
-        parts: Array<{ type: string; text: string }>;
-      };
-    }) => Promise<unknown> | unknown;
-  };
+  session?: OpenCodeSessionClient;
 }
 
 /** Toast severity as accepted by OpenCode's `tui.showToast`. */
@@ -242,6 +232,19 @@ export interface ModelForecastPluginOptions {
    */
   fallback?: {
     enabled?: boolean;
+  };
+  /**
+   * supervised-model-fallback-recovery (SDD change) — PR-01.
+   * Config block for active supervision, watchdog timers, and parent recovery prompts.
+   */
+  recovery?: {
+    enabled?: boolean;
+    timeouts?: {
+      TOOL_EXECUTION_TIMEOUT_MS?: number;
+      ATTEMPT_HARD_TIMEOUT_MS?: number;
+      INACTIVITY_TIMEOUT_MS?: number;
+      FIRST_ACTIVITY_TIMEOUT_MS?: number;
+    };
   };
   /**
    * Override the model-data cache path for the config hook fallback

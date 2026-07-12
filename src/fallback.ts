@@ -33,6 +33,7 @@ import { resolveQuarantineTtlMs, type QuarantineErrorType, type QuarantineStore 
 import type { ClassifiedError } from "./error-classification.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
+import type { OpenCodeSessionClient } from "./opencode-client.js";
 
 /** A single fallback attempt record (used both mid-loop and in the terminal error). */
 export interface FallbackAttempt {
@@ -58,29 +59,10 @@ export interface FallbackExhaustedResult {
 export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult;
 
 /**
- * Loose structural shape of the OpenCode SDK's `client.session` surface
- * that the engine needs. Mirrors `client.session.create({body:{parentID?,
- * title?}})` (sdk.gen.d.ts:114) and `client.session.prompt({path:{id},
- * body:{model:{providerID,modelID}, agent, parts}})` (sdk.gen.d.ts:174).
- * Both members are optional so a caller can pass a partial/absent client
- * without the engine crashing.
+ * Structural shape of the OpenCode SDK client surface that the engine needs.
  */
-export interface FallbackSessionClient {
-  create?: (opts: {
-    body: { parentID?: string; title?: string };
-  }) => Promise<unknown> | unknown;
-  prompt?: (opts: {
-    path: { id: string };
-    body: {
-      model: { providerID: string; modelID: string };
-      agent: string;
-      parts: Array<{ type: string; text: string }>;
-    };
-  }) => Promise<unknown> | unknown;
-}
-
 export interface FallbackClient {
-  session?: FallbackSessionClient;
+  session?: OpenCodeSessionClient;
 }
 
 /**

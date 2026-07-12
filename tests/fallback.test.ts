@@ -42,13 +42,13 @@ describe("createFallbackEngine()", () => {
         }),
         prompt: vi.fn(async (opts: {
           path: { id: string };
-          body: { model: { providerID: string; modelID: string }; agent: string; parts: Array<{ type: string; text: string }> };
+          body: { model?: { providerID: string; modelID: string }; agent?: string; parts: Array<{ type: string; text: string }> };
         }) => {
           prompted.push({
             id: opts.path.id,
-            providerID: opts.body.model.providerID,
-            modelID: opts.body.model.modelID,
-            agent: opts.body.agent,
+            providerID: opts.body.model?.providerID ?? "",
+            modelID: opts.body.model?.modelID ?? "",
+            agent: opts.body.agent ?? "",
             text: opts.body.parts[0]?.text ?? "",
           });
           return { info: {}, parts: [{ type: "text", text: "task completed successfully" }] };
