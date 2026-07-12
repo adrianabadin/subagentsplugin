@@ -727,7 +727,7 @@ describe("plugin — 429-fallback gating", () => {
     }
   });
 
-  it("config hook clears the quarantine store", async () => {
+  it("config hook preserves an active automatic quarantine", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "plugin-clear-"));
     const quarantinePath = path.join(tempDir, "quarantine.json");
     try {
@@ -805,7 +805,7 @@ describe("plugin — 429-fallback gating", () => {
       { tool: { id: "task" }, sessionID: "s1", callID: "c-clear-test-3" },
       beforeOutput3,
     );
-    expect(beforeOutput3.args.subagent_type).toContain("__mf_sdd-design__openai-gpt-4-1-mini");
+    expect(beforeOutput3.args.subagent_type).toBe("sdd-design");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

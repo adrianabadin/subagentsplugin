@@ -927,37 +927,40 @@ describe("QuarantineStore — errorType field (additive)", () => {
   describe("resolveQuarantineTtlMs — TTL derivation from error type", () => {
     it("model_not_configured always resolves to Infinity (permanent)", () => {
       expect(
-        resolveQuarantineTtlMs({ errorType: "model_not_configured", model: "openai/gpt-5.5" }),
+        resolveQuarantineTtlMs({ errorType: "model_not_configured" }),
       ).toBe(Infinity);
     });
 
     it("rate_limit with a parseable reset signal uses that signal verbatim", () => {
       expect(
-        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "openai/gpt-5.5", ttlHintMs: 42_000 }),
+        resolveQuarantineTtlMs({ errorType: "rate_limit", ttlHintMs: 42_000 }),
       ).toBe(42_000);
     });
 
-    it("rate_limit without a reset signal defaults to 2h for google models", () => {
+    it("rate_limit without a reset signal defaults to 10 minutes for every provider", () => {
       expect(
-        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "google/gemini-3.5-flash" }),
-      ).toBe(2 * 60 * 60 * 1000);
+        resolveQuarantineTtlMs({ errorType: "rate_limit" }),
+      ).toBe(10 * 60 * 1000);
     });
 
-    it("rate_limit without a reset signal defaults to 60min (store default) for non-google models", () => {
+    it("rate_limit clamps explicit TTL hints to the ratified range", () => {
       expect(
-        resolveQuarantineTtlMs({ errorType: "rate_limit", model: "openai/gpt-5.5" }),
-      ).toBeUndefined(); // undefined ⇒ caller falls back to QuarantineStore's own 60min default
+        resolveQuarantineTtlMs({ errorType: "rate_limit", ttlHintMs: 1 }),
+      ).toBe(1_000);
+      expect(
+        resolveQuarantineTtlMs({ errorType: "rate_limit", ttlHintMs: 999_999_999 }),
+      ).toBe(86_400_000);
     });
 
     it("provider_error always resolves to Infinity (permanent, unchanged from pre-existing behavior)", () => {
       expect(
-        resolveQuarantineTtlMs({ errorType: "provider_error", model: "openai/gpt-5.5" }),
+        resolveQuarantineTtlMs({ errorType: "provider_error" }),
       ).toBe(Infinity);
     });
 
     it("other / undefined errorType resolves to undefined (store default applies)", () => {
-      expect(resolveQuarantineTtlMs({ errorType: "other", model: "openai/gpt-5.5" })).toBeUndefined();
-      expect(resolveQuarantineTtlMs({ model: "openai/gpt-5.5" })).toBeUndefined();
+      expect(resolveQuarantineTtlMs({ errorType: "other" })).toBeUndefined();
+      expect(resolveQuarantineTtlMs({})).toBeUndefined();
     });
   });
 
@@ -980,6 +983,30 @@ describe("QuarantineStore — errorType field (additive)", () => {
     expect(warnLogs.some((line) => line.includes("saveToFile failed"))).toBe(true);
     // In-memory state for the current invocation is untouched.
     expect(store.isBlocked("openai/gpt-5.5")).toBe(true);
+  });
+});
+
+describe("QuarantineStore — automatic recovery scope", () => {
+  it("rate limits expand the exact model group", () => {
+    const store = new QuarantineStore({ now: () => 1_000_000 });
+    store.addAutomaticRateLimit("google/gemini-3.5-flash", "429", 60_000);
+    expect(store.isBlocked("google/gemini-3.5-flash")).toBe(true);
+    expect(store.isBlocked("google/gemini-3-flash")).toBe(true);
+  });
+
+  it("an unavailable model stays an exact-model quarantine", () => {
+    const store = new QuarantineStore({ now: () => 1_000_000 });
+    store.addAutomaticExactModel("google/gemini-3.5-flash", "model_not_found", "model_not_configured");
+    expect(store.isBlocked("google/gemini-3.5-flash")).toBe(true);
+    expect(store.isBlocked("google/gemini-3-flash")).toBe(false);
+  });
+
+  it("provider errors expand to the entire provider", () => {
+    const store = new QuarantineStore({ now: () => 1_000_000 });
+    store.addAutomaticProvider("google", "invalid_api_key", "provider_error");
+    expect(store.isBlocked("google/gemini-3.5-flash")).toBe(true);
+    expect(store.isBlocked("google/gemini-3.1-pro")).toBe(true);
+    expect(store.isBlocked("openai/gpt-5.5")).toBe(false);
   });
 });
 

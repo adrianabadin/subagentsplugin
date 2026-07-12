@@ -645,7 +645,7 @@ describe("createAfterHook()", () => {
     expect(stderrLines[0]).toContain("none");
   });
 
-  it("uses a 2-hour TTL for google rate-limit quarantine", async () => {
+  it("uses the 10-minute default TTL for google rate-limit quarantine", async () => {
     const targetAlias = generatedProfileAlias("sdd-design", "google/gemini-3.5-flash");
     const tracking = buildTrackingWith("c1", targetAlias, "google/gemini-3.5-flash", "sdd-design");
     const nowMs = 1_700_000_000;
@@ -674,7 +674,7 @@ describe("createAfterHook()", () => {
     expect(models).toContain("google/gemini-3.5-flash");
     // All entries share the same TTL
     for (const entry of snap) {
-      expect(entry.expiresAt).toBe(nowMs + 2 * 60 * 60 * 1000);
+      expect(entry.expiresAt).toBe(nowMs + 10 * 60 * 1000);
     }
   });
 
@@ -1080,8 +1080,8 @@ describe("createAfterHook() — provider and billing errors (permanent quarantin
     expect(record["reason"]).toBe("insufficient_funds");
 
     const snap = quarantine.snapshot();
-    expect(snap).toHaveLength(1);
-    expect(snap[0]?.expiresAt).toBe(Infinity);
+    expect(snap.length).toBeGreaterThan(1);
+    expect(snap.every((entry) => entry.expiresAt === Infinity)).toBe(true);
   });
 });
 

@@ -54,6 +54,11 @@ import {
   resolveModelGroup,
   resolveQuarantineTarget,
 } from "./model-groups.js";
+import {
+  DEFAULT_RATE_LIMIT_TTL_MS,
+  MAX_RATE_LIMIT_TTL_MS,
+  MIN_RATE_LIMIT_TTL_MS,
+} from "./recovery-policy.js";
 
 /**
  * model-fallback-error-classification (SDD change) — Slice 1, task 5-6.
@@ -163,18 +168,16 @@ export function resolveQuarantineTtlMs(params: {
    * `undefined` back, same as omitting `errorType` entirely.
    */
   errorType?: QuarantineErrorType | "other";
-  model: string;
   ttlHintMs?: number;
 }): number | undefined {
-  const { errorType, model, ttlHintMs } = params;
+  const { errorType, ttlHintMs } = params;
   if (errorType === "model_not_configured") return Infinity;
   if (errorType === "provider_error") return Infinity;
   if (errorType === "rate_limit") {
-    if (ttlHintMs !== undefined) return ttlHintMs;
-    const slash = model.indexOf("/");
-    const provider = slash > 0 ? model.slice(0, slash).toLowerCase() : "";
-    if (provider === "google") return 2 * 60 * 60 * 1000;
-    return undefined;
+    if (ttlHintMs === undefined || !Number.isFinite(ttlHintMs) || ttlHintMs <= 0) {
+      return DEFAULT_RATE_LIMIT_TTL_MS;
+    }
+    return Math.min(MAX_RATE_LIMIT_TTL_MS, Math.max(MIN_RATE_LIMIT_TTL_MS, Math.ceil(ttlHintMs)));
   }
   return undefined;
 }
@@ -232,6 +235,40 @@ export class QuarantineStore implements QuarantineBlocklist {
     }
     this.logger?.info("quarantine", `add model=${model} reason=${reason} ttlMs=${ttlMs ?? this.ttlMs} permanent=${expiresAt === Infinity} manual=false errorType=${errorType ?? "(none)"} group=${group.length > 1 ? `expanded to ${group.length} aliases` : "singleton"}`);
     return entry;
+  }
+
+  /** Automatic rate limits quarantine the complete equivalent-model group. */
+  addAutomaticRateLimit(model: string, reason: string, ttlMs: number): QuarantineEntry[] {
+    const expiresAt = this.now() + ttlMs;
+    return resolveModelGroup(model).map((alias) => {
+      const entry: QuarantineEntry = { model: alias, reason, expiresAt, errorType: "rate_limit" };
+      this.entries.set(alias, entry);
+      return entry;
+    });
+  }
+
+  /** An unavailable model blocks only its exact identifier. */
+  addAutomaticExactModel(
+    model: string,
+    reason: string,
+    errorType: "model_not_configured",
+  ): QuarantineEntry {
+    const entry: QuarantineEntry = { model, reason, expiresAt: Infinity, errorType };
+    this.entries.set(model, entry);
+    return entry;
+  }
+
+  /** Provider-level failures block every configured model under that provider. */
+  addAutomaticProvider(
+    provider: string,
+    reason: string,
+    errorType: "provider_error",
+  ): QuarantineEntry[] {
+    return resolveQuarantineTarget(`${provider}/*`).map((model) => {
+      const entry: QuarantineEntry = { model, reason, expiresAt: Infinity, errorType };
+      this.entries.set(model, entry);
+      return entry;
+    });
   }
 
   /**

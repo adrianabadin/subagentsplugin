@@ -44,6 +44,7 @@ import { DEFAULT_LADDER } from "./policy.js";
 import { MISSING_EVIDENCE_CONFIDENCE } from "./evidence.js";
 import { normalizePhase } from "./phases.js";
 import { QuarantineStore, resolveQuarantineTtlMs, type QuarantineErrorType } from "./quarantine.js";
+import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
 import {
   classifyError,
   extractResetHintMs,
@@ -587,8 +588,22 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     // fall back to the static per-error-type defaults centralized in
     // `resolveQuarantineTtlMs` (quarantine.ts).
     const ttlHintMs = extractResetHintMs(output.metadata);
-    const ttlMs = resolveQuarantineTtlMs({ errorType, model: tracked.model, ttlHintMs });
-    const entry = quarantine.add(tracked.model, reason, ttlMs, errorType);
+    const rateLimitTtlMs = errorType === "rate_limit"
+      ? resolveRateLimitTtlMs([
+        { source: "structured_retry_after", value: ttlHintMs },
+        { source: "text", value: text },
+      ], Date.now())
+      : undefined;
+    const ttlMs = resolveQuarantineTtlMs({ errorType, ttlHintMs: rateLimitTtlMs });
+    const entry = errorType === "rate_limit"
+      ? quarantine.addAutomaticRateLimit(tracked.model, reason, ttlMs!)[0]!
+      : errorType === "model_not_configured"
+        ? quarantine.addAutomaticExactModel(tracked.model, reason, errorType)
+        : quarantine.addAutomaticProvider(
+          tracked.model.split("/", 1)[0] ?? "",
+          reason,
+          errorType as "provider_error",
+        )[0]!;
     const nextViable = findNextViableModel(
       catalog,
       tracked.originalSubagentType,

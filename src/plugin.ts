@@ -720,9 +720,6 @@ export default async function modelForecastPlugin(
 
   const hooks: Record<string, unknown> = {
     config: async (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
-      // Only clear TTL-based quarantines (rate limits); permanent quarantines
-      // (provider/billing errors) persist across plugin restarts.
-      quarantine.clearNonPermanent();
       if (options?.generatedProfiles?.enabled === false) return;
       // OpenCode AWAITS the config hook; any rejection here surfaces as a
       // structured `Cause { failures: [...] }` and aborts startup. Wrap the

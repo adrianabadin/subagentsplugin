@@ -29,11 +29,12 @@
  * after the one attempt the caller already reports) instead of throwing.
  */
 
-import { resolveQuarantineTtlMs, type QuarantineErrorType, type QuarantineStore } from "./quarantine.js";
+import { type QuarantineErrorType, type QuarantineStore } from "./quarantine.js";
 import type { ClassifiedError } from "./error-classification.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
+import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
 
 /** A single fallback attempt record (used both mid-loop and in the terminal error). */
 export interface FallbackAttempt {
@@ -233,14 +234,12 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         const reason = err instanceof Error ? err.message : "session_create_failed";
         logger?.warn("fallback", `session.create threw for ${nextModel}: ${reason}`);
         attempts.push({ model: nextModel, reason: "session_create_failed" });
-        quarantine.add(nextModel, "session_create_failed");
         continue;
       }
 
       if (sessionId === undefined) {
         logger?.warn("fallback", `session.create for ${nextModel} did not return a usable session id`);
         attempts.push({ model: nextModel, reason: "session_create_failed" });
-        quarantine.add(nextModel, "session_create_failed");
         continue;
       }
 
@@ -268,7 +267,6 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         const reason = err instanceof Error ? err.message : "prompt_failed";
         logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
         attempts.push({ model: nextModel, reason });
-        quarantine.add(nextModel, reason);
         continue;
       }
 
@@ -282,8 +280,21 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       }
 
       const errorType = classified.type as QuarantineErrorType;
-      const ttlMs = resolveQuarantineTtlMs({ errorType, model: nextModel });
-      quarantine.add(nextModel, classified.code, ttlMs, errorType);
+      if (errorType === "rate_limit") {
+        quarantine.addAutomaticRateLimit(
+          nextModel,
+          classified.code,
+          resolveRateLimitTtlMs([{ source: "text", value: text }], Date.now()),
+        );
+      } else if (errorType === "model_not_configured") {
+        quarantine.addAutomaticExactModel(nextModel, classified.code, errorType);
+      } else {
+        quarantine.addAutomaticProvider(
+          nextModel.split("/", 1)[0] ?? "",
+          classified.code,
+          errorType as "provider_error",
+        );
+      }
       logger?.info("fallback", `attempt ${attempts.length + 1} failed on ${nextModel} (${classified.code}); quarantined`);
       attempts.push({ model: nextModel, reason: classified.code });
     }
