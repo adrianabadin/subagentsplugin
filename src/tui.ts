@@ -46,6 +46,8 @@ import {
   quarantineMenuOptions,
   validateHours,
 } from "./tui-quarantine.js";
+import type { RecoveryStateEntry } from "./state-file.js";
+import { defaultStatePath, readStateFile } from "./state-file.js";
 
 type TuiDialogSelectOption<Value = string> = {
   title: string;
@@ -54,6 +56,38 @@ type TuiDialogSelectOption<Value = string> = {
   category?: string;
   disabled?: boolean;
 };
+
+export function recoveryViewOptions(state: {
+  activeRecoveryCount: number;
+  activeRecoveries: RecoveryStateEntry[];
+  lastRecovery: RecoveryStateEntry | null;
+} | null): TuiDialogSelectOption[] {
+  if (state === null || state.activeRecoveryCount === 0) {
+    return [
+      { title: "No active recoveries", value: "empty", disabled: true },
+      {
+        title: state?.lastRecovery === null || state === null ? "Last recovery: none" : `Last recovery: ${state.lastRecovery.result ?? state.lastRecovery.state}`,
+        value: "last",
+        disabled: true,
+      },
+    ];
+  }
+  const options: TuiDialogSelectOption[] = state.activeRecoveries.map((recovery) => ({
+    title: `${recovery.originalModel} -> ${recovery.fallbackModel ?? "none"}`,
+    value: recovery.callID,
+    description: `${recovery.callID} | ${recovery.state}${recovery.failure === undefined ? "" : ` | ${recovery.failure}`}`,
+    disabled: true,
+  }));
+  if (state.lastRecovery !== null) {
+    options.push({
+      title: `Last recovery: ${state.lastRecovery.result ?? state.lastRecovery.state}`,
+      value: "last",
+      description: `${state.lastRecovery.originalModel} -> ${state.lastRecovery.fallbackModel ?? "none"}${state.lastRecovery.failure === undefined ? "" : ` | ${state.lastRecovery.failure}`}`,
+      disabled: true,
+    });
+  }
+  return options;
+}
 
 type TuiApi = {
   lifecycle?: {
@@ -186,6 +220,7 @@ function modelOptions(session: ConfigDialogSession): TuiDialogSelectOption[] {
   return [
     { title: "Add model", value: "__add__", description: "Create a new model entry" },
     { title: "Quarantine", value: "__quarantine__", description: "Block a model or provider group (immediate effect)" },
+    { title: "Recovery status", value: "__recovery__", description: "View active and most recent supervised recoveries" },
     { title: "Save changes", value: "__save__", description: "Persist global benchmarks config", disabled: !session.dirty },
     ...options,
   ];
@@ -222,8 +257,21 @@ function showRootMenu(api: TuiApi, session: ConfigDialogSession): void {
         showQuarantineMenu(api, session);
         return;
       }
+      if (option.value === "__recovery__") {
+        void showRecoveryStatus(api, session);
+        return;
+      }
       showModelMenu(api, session, String(option.value));
     },
+  }));
+}
+
+async function showRecoveryStatus(api: TuiApi, session: ConfigDialogSession): Promise<void> {
+  const state = await readStateFile(defaultStatePath());
+  api.ui.dialog.replace(() => renderSelect(api, {
+    title: "Recovery status",
+    options: recoveryViewOptions(state),
+    onSelect: () => showRootMenu(api, session),
   }));
 }
 

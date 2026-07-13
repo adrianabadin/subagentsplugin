@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import tuiModule from "../src/tui.js";
-import { tui } from "../src/tui.js";
+import { recoveryViewOptions, tui } from "../src/tui.js";
 
 type KeymapLayer = {
   mode?: string;
@@ -55,6 +55,37 @@ function makeApi(overrides: Record<string, unknown> = {}) {
 }
 
 describe("tui entry", () => {
+  it("renders an empty recovery view", () => {
+    expect(recoveryViewOptions(null)).toEqual([
+      { title: "No active recoveries", value: "empty", disabled: true },
+      { title: "Last recovery: none", value: "last", disabled: true },
+    ]);
+  });
+
+  it("renders active recoveries and the most recent result", () => {
+    const options = recoveryViewOptions({
+      activeRecoveryCount: 1,
+      activeRecoveries: [{
+        callID: "call-1",
+        originalModel: "openai/gpt-5.5",
+        fallbackModel: "anthropic/claude-sonnet-4-5",
+        state: "fallback-running",
+      }],
+      lastRecovery: {
+        callID: "call-0",
+        originalModel: "openai/gpt-5.5",
+        fallbackModel: "anthropic/claude-sonnet-4-5",
+        state: "completed-fallback",
+        result: "success",
+      },
+    });
+
+    expect(options).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "openai/gpt-5.5 -> anthropic/claude-sonnet-4-5", description: "call-1 | fallback-running" }),
+      expect.objectContaining({ title: "Last recovery: success", description: "openai/gpt-5.5 -> anthropic/claude-sonnet-4-5" }),
+    ]));
+  });
+
   it("exports an explicit TUI plugin module", () => {
     expect(tuiModule).toMatchObject({
       id: "aabadin.model-forecast.tui",

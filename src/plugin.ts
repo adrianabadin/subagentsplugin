@@ -61,7 +61,9 @@ import { AttemptCoordinator } from "./attempt-coordinator.js";
 import { AttemptWatchdog, type AttemptWatchdogTimeouts } from "./attempt-watchdog.js";
 import { safeAbortSession } from "./session-abort.js";
 import { ParentRecovery } from "./parent-recovery.js";
-import type { HooksConfig, ModelDataCache, SelectionMode } from "./types.js";
+import { createRecoveryAuditRecorder } from "./audit.js";
+import { defaultStatePath, writeStateFile, type RecoveryStateEntry } from "./state-file.js";
+import type { AuditEntry, HooksConfig, ModelDataCache, RecoveryAuditEntry, SelectionMode } from "./types.js";
 import type { ResolveCandidates } from "./hooks.js";
 import type { AttemptFailure } from "./recovery-types.js";
 
@@ -133,6 +135,136 @@ export interface PluginClient {
 
 /** Toast severity as accepted by OpenCode's `tui.showToast`. */
 export type ToastVariant = "info" | "success" | "warning" | "error";
+
+/** Emits each recovery milestone once per task, even when hooks race. */
+export function createRecoveryToastEmitter(client: PluginClient | undefined): (
+  callID: string,
+  event: string,
+  message: string,
+  variant: ToastVariant,
+) => void {
+  const emitted = new Set<string>();
+  return (callID, event, message, variant): void => {
+    const key = `${callID}:${event}`;
+    if (emitted.has(key)) return;
+    emitted.add(key);
+    showToastSafely(client, message, variant);
+  };
+}
+
+type RecoveryObserver = {
+  observe: (entry: RecoveryAuditEntry) => void;
+  publish: (coordinator: AttemptCoordinator) => void;
+};
+
+function createRecoveryObserver(options: ModelForecastPluginOptions | undefined): RecoveryObserver {
+  const recorder = createRecoveryAuditRecorder({
+    auditPath: options?.recovery?.auditPath,
+    writeEngram: options?.recovery?.writeEngram,
+  });
+  const statePath = options?.recovery?.statePath ?? defaultStatePath();
+  let lastRecovery: RecoveryStateEntry | null = null;
+  return {
+    observe(entry): void {
+      if (entry.terminal) {
+        lastRecovery = {
+          callID: entry.callID,
+          originalModel: entry.originalModel,
+          fallbackModel: entry.fallbackModel ?? null,
+          state: entry.state ?? entry.event,
+          ...(entry.result !== undefined ? { result: entry.result } : {}),
+          ...(entry.message !== undefined ? { failure: entry.message } : {}),
+        };
+      }
+      void recorder.record(entry);
+    },
+    publish(coordinator): void {
+      const activeRecoveries: RecoveryStateEntry[] = [];
+      for (const task of coordinator.tasksByCallID.values()) {
+        if (task.state !== "failure-claimed" && task.state !== "fallback-running" && task.state !== "awaiting-original-settlement") continue;
+        activeRecoveries.push({
+          callID: task.callID,
+          originalModel: task.originalModel,
+          fallbackModel: task.fallbackResult?.status === "success" ? task.fallbackResult.model : null,
+          state: task.state,
+          ...(task.failure !== undefined ? { failure: task.failure.code } : {}),
+        });
+      }
+      void writeStateFile(statePath, {
+        selectedModel: null, selectedEffort: "", selectedConfidence: 0,
+        fallbackModel: null, fallbackConfidence: 0, preset: "", mode: "auto",
+        quarantineCount: 0, quarantined: [], cacheAge: null,
+        lastUpdate: new Date().toISOString(),
+        activeRecoveryCount: activeRecoveries.length,
+        activeRecoveries,
+        lastRecovery,
+      }).catch(() => {});
+    },
+  };
+}
+
+function instrumentRecoveryCoordinator(
+  coordinator: AttemptCoordinator,
+  observer: RecoveryObserver,
+  toast: ReturnType<typeof createRecoveryToastEmitter>,
+): void {
+  const emit = (entry: RecoveryAuditEntry, message?: string, variant?: ToastVariant): void => {
+    observer.observe(entry);
+    observer.publish(coordinator);
+    if (message !== undefined && variant !== undefined) toast(entry.callID, entry.event, message, variant);
+  };
+  const claimFailure = coordinator.claimFailure.bind(coordinator);
+  coordinator.claimFailure = (input) => {
+    const result = claimFailure(input);
+    const task = coordinator.tasksByCallID.get(input.callID);
+    if (result.claimed && task !== undefined) emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: task.callID, event: "failure_detected", originalModel: task.originalModel, terminal: false, state: task.state, message: input.failure.code });
+    return result;
+  };
+  const registerAbort = coordinator.registerPluginAbort.bind(coordinator);
+  coordinator.registerPluginAbort = (input) => {
+    const record = registerAbort(input);
+    const task = coordinator.tasksByCallID.get(input.callID);
+    if (task !== undefined) emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: task.callID, event: "abort_requested", originalModel: task.originalModel, terminal: false, state: task.state, message: input.reason });
+    return record;
+  };
+  const setFallbackPromise = coordinator.setFallbackPromise.bind(coordinator);
+  coordinator.setFallbackPromise = (input) => {
+    const promise = setFallbackPromise(input);
+    const task = coordinator.tasksByCallID.get(input.callID);
+    if (task !== undefined) emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: task.callID, event: "fallback_started", originalModel: task.originalModel, terminal: false, state: task.state }, "model-forecast: fallback started", "info");
+    return promise;
+  };
+  const recordFallbackResult = coordinator.recordFallbackResult.bind(coordinator);
+  coordinator.recordFallbackResult = (input) => {
+    const task = recordFallbackResult(input);
+    if (task.fallbackResult !== input.result) return task;
+    const event = input.result.status === "success" ? "fallback_succeeded" : input.result.status === "exhausted" ? "fallback_exhausted" : "cancelled";
+    const result = input.result.status === "success" ? "success" : input.result.status === "exhausted" ? "exhausted" : "cancelled";
+    emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: input.callID, event, originalModel: task.originalModel, fallbackModel: input.result.status === "success" ? input.result.model : null, terminal: true, state: task.state, result, message: task.failure?.code }, `model-forecast: ${event.replaceAll("_", " ")}`, input.result.status === "success" ? "success" : "warning");
+    return task;
+  };
+  const cancelTask = coordinator.cancelTask.bind(coordinator);
+  coordinator.cancelTask = (input) => {
+    const task = cancelTask(input);
+    if (task !== undefined && task.state === "cancelled") emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: task.callID, event: "cancelled", originalModel: task.originalModel, terminal: true, state: task.state, result: "cancelled" });
+    return task;
+  };
+  const cancelParent = coordinator.cancelParent.bind(coordinator);
+  coordinator.cancelParent = (input) => {
+    const tasks = cancelParent(input);
+    for (const task of tasks) {
+      emit({ kind: "recovery", timestamp: new Date().toISOString(), callID: task.callID, event: "cancelled", originalModel: task.originalModel, terminal: true, state: task.state, result: "cancelled" });
+    }
+    return tasks;
+  };
+  const markParentRecoveryEnqueued = coordinator.markParentRecoveryEnqueued.bind(coordinator);
+  coordinator.markParentRecoveryEnqueued = (callID, now) => {
+    const marked = markParentRecoveryEnqueued(callID, now);
+    const task = coordinator.tasksByCallID.get(callID);
+    if (marked && task !== undefined) emit({ kind: "recovery", timestamp: new Date().toISOString(), callID, event: "parent_recovery", originalModel: task.originalModel, terminal: false, state: task.state }, "model-forecast: parent recovery enqueued", "info");
+    return marked;
+  };
+}
 
 import { Logger, extractProjectInfo, logLegacy } from "./logger.js";
 
@@ -253,6 +385,9 @@ export interface ModelForecastPluginOptions {
       INACTIVITY_TIMEOUT_MS?: number;
       FIRST_ACTIVITY_TIMEOUT_MS?: number;
     };
+    auditPath?: string;
+    statePath?: string;
+    writeEngram?: (entry: AuditEntry) => Promise<void> | void;
   };
   /**
    * Override the model-data cache path for the config hook fallback
@@ -647,7 +782,35 @@ export default async function modelForecastPlugin(
   // stay isolated. Production wiring always passes the coordinator to
   // both hooks AND the fallback engine — `plugin.ts` no longer reads
   // `innerAfterHook?.fallbackSessionIDs`.
-  const coordinator = new AttemptCoordinator({ logger });
+  const recoveryObserver = createRecoveryObserver(options);
+  let coordinatorForAudit: AttemptCoordinator | undefined;
+  const recoveryLogger = {
+    trace: logger.trace.bind(logger),
+    info: logger.info.bind(logger),
+    warn(scope: string, message: string): void {
+      logger.warn(scope, message);
+      if (!message.startsWith("invalid_transition:")) return;
+      const callID = /callID=([^\)\s]+)/.exec(message)?.[1] ?? "unknown";
+      recoveryObserver.observe({
+        kind: "recovery",
+        timestamp: new Date().toISOString(),
+        callID,
+        event: "invalid_transition",
+        originalModel: coordinatorForAudit?.tasksByCallID.get(callID)?.originalModel ?? "",
+        terminal: false,
+        message,
+      });
+      if (coordinatorForAudit !== undefined) recoveryObserver.publish(coordinatorForAudit);
+    },
+    error: logger.error.bind(logger),
+  } as Logger;
+  const coordinator = new AttemptCoordinator({ logger: recoveryLogger });
+  coordinatorForAudit = coordinator;
+  instrumentRecoveryCoordinator(
+    coordinator,
+    recoveryObserver,
+    createRecoveryToastEmitter(client),
+  );
   const parentRecovery = new ParentRecovery({ coordinator, client: client?.session });
   let watchdog: AttemptWatchdog | undefined;
   const recoveryEnabled = options?.recovery?.enabled !== false;

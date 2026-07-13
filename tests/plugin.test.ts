@@ -22,7 +22,7 @@ import { tmpdir } from "os";
 import path from "path";
 
 import { readCache } from "../src/cache.js";
-import { modelForecastPlugin, refreshCache } from "../src/plugin.js";
+import { createRecoveryToastEmitter, modelForecastPlugin, refreshCache } from "../src/plugin.js";
 import type { Discovery } from "../src/models.js";
 
 describe("plugin — default export shape (no auto-injection)", () => {
@@ -202,6 +202,17 @@ describe("plugin — fire-and-forget cache refresh", () => {
  * remains pinned by tests/smoke.test.ts.
  * -------------------------------------------------------------------------- */
 describe("plugin — 429-fallback gating", () => {
+  it("deduplicates recovery toasts by call and event", () => {
+    const showToast = vi.fn();
+    const emit = createRecoveryToastEmitter({ tui: { showToast } });
+
+    emit("call-1", "fallback_started", "Fallback started", "info");
+    emit("call-1", "fallback_started", "Fallback started", "info");
+    emit("call-1", "fallback_succeeded", "Fallback completed", "success");
+
+    expect(showToast).toHaveBeenCalledTimes(2);
+  });
+
   let tempDir: string;
 
   beforeEach(async () => {
