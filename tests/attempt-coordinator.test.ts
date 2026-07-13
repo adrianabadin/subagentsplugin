@@ -650,6 +650,17 @@ describe("AttemptCoordinator — late event (PR-04.11)", () => {
     expect(coordinator.tasksByCallID.get("late-2")?.state).toBe("completed-original");
     expect(coordinator.tasksByCallID.get("late-2")?.fallbackResult).toBeUndefined();
   });
+
+  it("returns a safe shell when a late original result arrives after cleanup", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    const task = buildTask(coordinator, { callID: "late-3" });
+    coordinator.reportOriginalResult({ callID: task.callID, output: "ok", now: 2_000 });
+    coordinator.finalize({ callID: task.callID, now: 3_000 });
+
+    const late = coordinator.reportOriginalResult({ callID: task.callID, output: "late", now: 4_000 });
+
+    expect(late).toMatchObject({ callID: task.callID, state: "cleaned" });
+  });
 });
 
 // ===========================================================================

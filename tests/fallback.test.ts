@@ -496,4 +496,66 @@ describe("createFallbackEngine()", () => {
       vi.useRealTimers();
     }
   });
+
+  it("returns cancellation when a prompt rejects after the owning task is cancelled", async () => {
+    const coordinator = new (await import("../src/attempt-coordinator.js")).AttemptCoordinator();
+    coordinator.registerTask({ callID: "cancel-after-rejection", parentSessionID: "parent", originalSubagentType: "sdd-design", generatedAlias: "alias", originalModel: "openai/gpt-4.1-mini", prompt: "work" });
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn(async () => ({ id: "child" })),
+          prompt: vi.fn(async () => {
+            coordinator.cancelTask({ callID: "cancel-after-rejection", reason: "user_cancelled" });
+            throw new Error("network down");
+          }),
+        },
+      },
+      quarantine: new QuarantineStore({ ttlMs: 1_000 }),
+      catalog: makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      coordinator,
+    });
+
+    await expect(engine.run({ sessionID: "parent", taskCallID: "cancel-after-rejection", originalSubagentType: "sdd-design", prompt: "work", failedModel: "openai/gpt-4.1-mini", failureReason: "rate_limit" })).resolves.toMatchObject({ status: "cancelled", reason: "user_cancelled" });
+  });
+
+  it("records a non-Error prompt rejection as a failed fallback attempt", async () => {
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn(async () => ({ id: "child" })),
+          prompt: vi.fn(async () => Promise.reject("network down")),
+        },
+      },
+      quarantine: new QuarantineStore({ ttlMs: 1_000 }),
+      catalog: makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 2,
+    });
+
+    const result = await engine.run({ sessionID: "parent", originalSubagentType: "sdd-design", prompt: "work", failedModel: "openai/gpt-4.1-mini", failureReason: "rate_limit" });
+
+    expect(result).toMatchObject({ status: "exhausted" });
+    expect(result.attempts[1]).toMatchObject({ model: "minimax/M3", reason: "session_prompt_failed" });
+  });
+
+  it("can recover when the original failed model has no provider segment", async () => {
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn(async () => ({ id: "child" })),
+          prompt: vi.fn(async () => ({ parts: [{ type: "text", text: "recovered" }] })),
+        },
+      },
+      quarantine: new QuarantineStore({ ttlMs: 1_000 }),
+      catalog: makeCatalog({ "sdd-design": [{ modelId: "unqualified" }, { modelId: "minimax/M3" }] }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 2,
+    });
+
+    await expect(engine.run({ sessionID: "parent", originalSubagentType: "sdd-design", prompt: "work", failedModel: "unqualified", failureReason: "rate_limit" })).resolves.toMatchObject({ status: "success", model: "minimax/M3" });
+  });
 });

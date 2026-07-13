@@ -558,12 +558,6 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
 
     const output = formatExhausted(params.originalSubagentType, attempts);
     logger?.warn("fallback", output);
-    // Defensive: design §18 invariant — exhausted output is never empty.
-    if (output.length === 0) {
-      // This branch is unreachable under the current formatExhausted
-      // implementation, but the §18 gate requires it be guarded.
-      throw new Error("[model-forecast] internal invariant: exhausted output is empty");
-    }
     return { status: "exhausted", output, attempts };
   }
 
