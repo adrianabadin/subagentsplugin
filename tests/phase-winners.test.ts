@@ -246,7 +246,7 @@ function rankedFor(phase: string) {
         date: e.date,
         confidence: e.confidence,
       },
-    } as unknown as { provider: string; model: string };
+    };
   });
   const signals = normalizeTaskContext({
     diffLines: 400,
