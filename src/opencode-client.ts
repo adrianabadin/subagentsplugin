@@ -52,3 +52,7 @@ export interface OpenCodeSessionClient {
     };
   }) => Promise<unknown> | unknown;
 }
+
+export interface OpenCodeClient {
+  session?: OpenCodeSessionClient;
+}

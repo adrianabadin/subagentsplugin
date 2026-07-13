@@ -194,22 +194,6 @@ describe("createTaskHook — coordinator.registerTask on accepted switch", () =>
     expect(coordinator.tasksByCallID.get("c2")?.prompt).toBe("second");
   });
 
-  it("falls back to writing the legacy tracking map when no coordinator is supplied (back-compat)", async () => {
-    // Back-compat surface: callers that still pass `tracking` (legacy
-    // Map<string, TrackedCall>) without a coordinator keep working.
-    const tracking = new Map<string, { originalSubagentType: string; targetAlias: string; model: string }>();
-    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-5.5");
-    const hook = createTaskHook(cfg, {
-      select: () => decision({ subagent_type: targetAlias, model: "openai/gpt-5.5" }),
-      tracking,
-    });
-
-    const output = { args: { subagent_type: "sdd-design", prompt: "design" } };
-    await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
-
-    expect(tracking.has("c1")).toBe(true);
-    expect(tracking.get("c1")?.targetAlias).toBe(targetAlias);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -611,13 +595,11 @@ describe("createFallbackEngine — coordinator.unmarkInternalSession after promp
 });
 
 // ---------------------------------------------------------------------------
-// 8. createFallbackEngine — back-compat without coordinator
+// 8. createFallbackEngine — coordinator-only internal session tracking
 // ---------------------------------------------------------------------------
 
-describe("createFallbackEngine — works without coordinator (back-compat surface)", () => {
-  it("still maintains fallbackSessionIDs internally and exposes the field on the engine", async () => {
-    // The back-compat field stays available so legacy callers and tests
-    // that read `engine.fallbackSessionIDs` keep working.
+describe("createFallbackEngine — coordinator-only session tracking", () => {
+  it("does not expose legacy fallbackSessionIDs", async () => {
     const client = {
       session: {
         create: vi.fn(async () => ({ id: "legacy-child" })),
@@ -640,7 +622,7 @@ describe("createFallbackEngine — works without coordinator (back-compat surfac
       logger: silentLogger(),
     });
 
-    expect(engine.fallbackSessionIDs).toBeInstanceOf(Set);
+    expect("fallbackSessionIDs" in engine).toBe(false);
 
     const result = await engine.run({
       sessionID: "parent",
@@ -650,8 +632,6 @@ describe("createFallbackEngine — works without coordinator (back-compat surfac
       failureReason: "429",
     });
     expect(result.status).toBe("success");
-    // Legacy session is tombstoned (active set drained after prompt).
-    expect(engine.fallbackSessionIDs.has("legacy-child")).toBe(false);
   });
 });
 

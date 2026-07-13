@@ -37,7 +37,10 @@
 import type { QuarantineErrorType, QuarantineStore } from "./quarantine.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
-import type { OpenCodeSessionClient } from "./opencode-client.js";
+import type { OpenCodeClient } from "./opencode-client.js";
+export type { OpenCodeClient } from "./opencode-client.js";
+/** @deprecated Use OpenCodeClient from opencode-client instead. */
+export type FallbackClient = OpenCodeClient;
 import type { AttemptCoordinator } from "./attempt-coordinator.js";
 import { safeAbortSession } from "./session-abort.js";
 import {
@@ -103,9 +106,6 @@ export interface FallbackCancelledResult {
 
 export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult | FallbackCancelledResult;
 
-export interface FallbackClient {
-  session?: OpenCodeSessionClient;
-}
 /**
  * Minimal shape of a `GeneratedProfileCatalog` slice needed to compute
  * `findNextViableModel` — deliberately duplicated (not imported) from
@@ -117,7 +117,7 @@ export interface FallbackCatalogSlice {
 }
 
 export interface FallbackEngineDeps {
-  client: FallbackClient | undefined;
+  client: OpenCodeClient | undefined;
   quarantine: QuarantineStore;
   catalog: FallbackCatalogSlice;
   ladder: readonly LadderRung[];
@@ -156,8 +156,6 @@ export interface FallbackRunParams {
 }
 
 export interface FallbackEngine {
-  fallbackSessionIDs: Set<string>;
-  tombstoneSessionIDs: Set<string>;
   run: (params: FallbackRunParams) => Promise<FallbackResult>;
 }
 
@@ -290,13 +288,10 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const sessionCreateTimeoutMs = deps.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
   const sessionPromptTimeoutMs = deps.sessionPromptTimeoutMs ?? ATTEMPT_HARD_TIMEOUT_MS;
   const nowFn = deps.now ?? ((): Date => new Date());
-  const fallbackSessionIDs = new Set<string>();
-  const tombstoneSessionIDs = new Set<string>();
   const attemptedProviders = new Set<string>();
   const providerHadError = new Set<string>();
 
   function markInternal(sessionId: string, taskCallID: string | undefined): void {
-    fallbackSessionIDs.add(sessionId);
     if (coordinator === undefined) return;
     try {
       coordinator.markInternalSession(sessionId, taskCallID);
@@ -309,8 +304,6 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   }
 
   function unmarkInternal(sessionId: string): void {
-    fallbackSessionIDs.delete(sessionId);
-    tombstoneSessionIDs.add(sessionId);
     if (coordinator === undefined) return;
     try {
       coordinator.unmarkInternalSession(sessionId);
@@ -454,8 +447,6 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       // PR-04b: when a coordinator is wired, the mark mirrors into
       // `coordinator.internalSessionIDs` so `coordinator.isInternalSession`
       // returns true throughout the prompt. The legacy
-      // `fallbackSessionIDs.add(sessionId)` is preserved inside
-      // `markInternal` for back-compat callers/tests.
       markInternal(sessionId, params.taskCallID);
 
       const { providerID, modelID } = splitModelId(nextModel);
@@ -577,7 +568,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
     return { status: "exhausted", output, attempts };
   }
 
-  return { fallbackSessionIDs, tombstoneSessionIDs, run };
+  return { run };
 }
 
 /**

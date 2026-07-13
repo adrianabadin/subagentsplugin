@@ -257,6 +257,7 @@ export class AttemptCoordinator {
 
   /** Active timers — cleared by `dispose()` so a plugin shutdown does not leak. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly completedTombstoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Logger either injected or no-op (best-effort, never throws). */
   private readonly logger: Logger;
   private readonly nowFn: () => number;
@@ -432,9 +433,8 @@ export class AttemptCoordinator {
     this.assertAlive();
     const attempt = this.attemptsByID.get(input.attemptID);
     if (attempt === undefined) {
-      throw new Error(
-        `[model-forecast] AttemptCoordinator.noteActivity: unknown attemptID '${input.attemptID}'`,
-      );
+      this.logInvalidTransition(input.attemptID, "noteActivity on cleaned or unknown attempt");
+      return unknownAttemptShell(input.attemptID);
     }
     if (isAttemptTerminal(attempt.state)) {
       this.logInvalidTransition(attempt.taskCallID, `noteActivity on terminal attempt '${attempt.id}' (state=${attempt.state})`);
@@ -708,6 +708,7 @@ export class AttemptCoordinator {
         }
         transitionTask(task, "cleaned", input.now ?? this.nowFn());
       }
+      this.removeTaskIndices(task);
       this.tasksByCallID.delete(input.callID);
     }
     // Even when the task was already evicted, a tombstone entry must
@@ -717,10 +718,12 @@ export class AttemptCoordinator {
       this.completedTombstones.set(input.callID, input.now ?? this.nowFn());
       const timer = setTimeout(() => {
         this.timers.delete(timer);
+        this.completedTombstoneTimers.delete(input.callID);
         this.completedTombstones.delete(input.callID);
       }, this.tombstoneTtlMs);
       timer.unref?.();
       this.timers.add(timer);
+      this.completedTombstoneTimers.set(input.callID, timer);
     }
   }
 
@@ -874,6 +877,7 @@ export class AttemptCoordinator {
       clearTimeout(timer);
     }
     this.timers.clear();
+    this.completedTombstoneTimers.clear();
     this.tasksByCallID.clear();
     this.attemptsByID.clear();
     this.attemptsBySessionID.clear();
@@ -903,6 +907,38 @@ export class AttemptCoordinator {
     const oldest = this.completedTombstones.keys().next();
     if (oldest.done) return;
     this.completedTombstones.delete(oldest.value);
+    const timer = this.completedTombstoneTimers.get(oldest.value);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.timers.delete(timer);
+      this.completedTombstoneTimers.delete(oldest.value);
+    }
+  }
+
+  private removeTaskIndices(task: TrackedTask): void {
+    const siblings = this.tasksByParentSessionID.get(task.parentSessionID);
+    if (siblings !== undefined) {
+      const remaining = siblings.filter((callID) => callID !== task.callID);
+      if (remaining.length === 0) this.tasksByParentSessionID.delete(task.parentSessionID);
+      else this.tasksByParentSessionID.set(task.parentSessionID, remaining);
+    }
+    for (const [sessionID, callID] of this.callIDBySessionID) {
+      if (callID === task.callID) this.callIDBySessionID.delete(sessionID);
+    }
+    for (const [attemptID, attempt] of this.attemptsByID) {
+      if (attempt.taskCallID !== task.callID) continue;
+      this.attemptsByID.delete(attemptID);
+      if (attempt.sessionID !== undefined) this.attemptsBySessionID.delete(attempt.sessionID);
+      const pending = this.pendingOriginalByParentID.get(attempt.parentSessionID);
+      if (pending !== undefined) {
+        const remaining = pending.filter((id) => id !== attemptID);
+        if (remaining.length === 0) this.pendingOriginalByParentID.delete(attempt.parentSessionID);
+        else this.pendingOriginalByParentID.set(attempt.parentSessionID, remaining);
+      }
+    }
+    for (const [sessionID, record] of this.pluginAbortSessionIDs) {
+      if (record.callID === task.callID) this.pluginAbortSessionIDs.delete(sessionID);
+    }
   }
 
   /**
@@ -969,4 +1005,25 @@ function noopLogger(): Logger {
     warn: () => {},
     error: () => {},
   } as unknown as Logger;
+}
+
+function unknownAttemptShell(id: string): ModelAttempt {
+  return {
+    id,
+    taskCallID: "",
+    kind: "fallback",
+    sequence: 1,
+    model: "",
+    provider: "",
+    agent: "",
+    parentSessionID: "",
+    state: "cleaned",
+    createdAt: 0,
+    lastActivityAt: 0,
+    retryCount: 0,
+    retryWaitAccumulatedMs: 0,
+    waitingPermission: false,
+    activeToolCallIDs: new Set<string>(),
+    watchdogGeneration: 0,
+  };
 }

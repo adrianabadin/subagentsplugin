@@ -496,10 +496,17 @@ describe("createAfterHook()", () => {
     targetAlias: string,
     model: string,
     original: string,
-  ): Map<string, unknown> {
-    const m = new Map<string, unknown>();
-    m.set(callID, { originalSubagentType: original, targetAlias, model });
-    return m;
+  ): AttemptCoordinator {
+    const coordinator = new AttemptCoordinator();
+    coordinator.registerTask({
+      callID,
+      parentSessionID: "parent",
+      originalSubagentType: original,
+      generatedAlias: targetAlias,
+      originalModel: model,
+      prompt: "",
+    });
+    return coordinator;
   }
 
   function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
@@ -526,7 +533,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as Map<string, never>,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -557,7 +564,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -601,7 +608,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       warnSink,
@@ -631,7 +638,7 @@ describe("createAfterHook()", () => {
     const stderrLines: string[] = [];
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       warnSink: (m) => stderrLines.push(m),
@@ -657,7 +664,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -692,7 +699,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -718,7 +725,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -734,14 +741,14 @@ describe("createAfterHook()", () => {
   });
 
   it("skips unknown callIDs (no entry in tracking map)", async () => {
-    const tracking = new Map<string, unknown>();
+    const tracking = new AttemptCoordinator();
     const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1 });
     const catalog = makeCatalog({ "x": [{ modelId: "model" }] });
     const audit = vi.fn();
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -764,7 +771,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -788,7 +795,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -814,7 +821,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -843,7 +850,7 @@ describe("createAfterHook()", () => {
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -867,132 +874,6 @@ describe("createAfterHook()", () => {
   });
 });
 
-/* -------------------------------------------------------------------------- *
- * 429-fallback — createTaskHook tracking-map wiring.
- * Spec #1316 requirement 1. The before hook writes
- * `tracking.set(callID, {originalSubagentType, targetAlias, model})`
- * when the decision is a "switch" with a non-empty subagent_type and
- * model. keep-default decisions do NOT populate the map. Eviction is
- * FIFO-bounded (1000 entries) to prevent unbounded memory in long
- * sessions (R13).
- * -------------------------------------------------------------------------- */
-describe("createTaskHook() — 429-fallback tracking map", () => {
-  function decision(overrides: Partial<SelectDecision> = {}): SelectDecision {
-    return {
-      action: "switch",
-      subagent_type: "__mf_sdd-design__openai-gpt-4-1-mini_a1b2c3",
-      model: "openai/gpt-4.1-mini",
-      effort: "high",
-      reason: "test decision",
-      confidence: 0.8,
-      evidence: "test evidence",
-      ...overrides,
-    };
-  }
-
-  it("populates tracking.set(callID, …) on a switch decision", async () => {
-    const tracking = new Map<string, unknown>();
-    const hook = createTaskHook(
-      {
-        mode: "auto",
-        confidenceThreshold: 0.6,
-        ladder: ["minimax", "google-antigravity", "openai", "glm-5.2", "anthropic"],
-        allowlist: ["sdd-design"],
-        denylist: [],
-      },
-      {
-        select: () => decision(),
-        tracking: tracking as never,
-      },
-    );
-
-    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
-    await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
-
-    const entry = tracking.get("c1") as
-      | { originalSubagentType: string; targetAlias: string; model: string }
-      | undefined;
-    expect(entry).toBeDefined();
-    expect(entry?.originalSubagentType).toBe("sdd-design");
-    expect(entry?.targetAlias).toBe("__mf_sdd-design__openai-gpt-4-1-mini_a1b2c3");
-    expect(entry?.model).toBe("openai/gpt-4.1-mini");
-  });
-
-  it("does NOT populate tracking when the decision is keep-default", async () => {
-    const tracking = new Map<string, unknown>();
-    const hook = createTaskHook(
-      {
-        mode: "auto",
-        confidenceThreshold: 0.6,
-        ladder: ["minimax", "google-antigravity", "openai", "glm-5.2", "anthropic"],
-        allowlist: ["sdd-design"],
-        denylist: [],
-      },
-      {
-        select: () => decision({ action: "keep-default", subagent_type: "" }),
-        tracking: tracking as never,
-      },
-    );
-
-    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
-    await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
-
-    expect(tracking.has("c1")).toBe(false);
-  });
-
-  it("does NOT populate tracking when a switch is downgraded to keep-default (denylist)", async () => {
-    const tracking = new Map<string, unknown>();
-    const hook = createTaskHook(
-      {
-        mode: "auto",
-        confidenceThreshold: 0.6,
-        ladder: ["minimax", "google-antigravity", "openai", "glm-5.2", "anthropic"],
-        allowlist: ["sdd-design"],
-        denylist: ["openai/gpt-4.1-mini"],
-      },
-      {
-        select: () => decision(),
-        tracking: tracking as never,
-      },
-    );
-
-    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
-    await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
-
-    expect(tracking.has("c1")).toBe(false);
-  });
-
-  it("FIFO-evicts the oldest entry when the map exceeds 1000 entries (R13)", async () => {
-    const tracking = new Map<string, unknown>();
-    const hook = createTaskHook(
-      {
-        mode: "auto",
-        confidenceThreshold: 0.6,
-        ladder: ["minimax", "google-antigravity", "openai", "glm-5.2", "anthropic"],
-        allowlist: ["sdd-design"],
-        denylist: [],
-      },
-      {
-        select: () => decision(),
-        tracking: tracking as never,
-      },
-    );
-
-    // Write 1001 entries with unique callIDs. The first one (c0) must
-    // be evicted.
-    for (let i = 0; i < 1001; i += 1) {
-      const output = { args: { subagent_type: "sdd-design", prompt: `work-${i}` } };
-      await hook(
-        { tool: { id: "task" }, sessionID: "s1", callID: `c${i}` },
-        output,
-      );
-    }
-    expect(tracking.size).toBeLessThanOrEqual(1000);
-    expect(tracking.has("c0")).toBe(false);
-    // The last-written entry must still be present.
-    expect(tracking.has("c1000")).toBe(true);
-  });
-});
 
 describe("detectProviderError()", () => {
   it("detects various provider, credential, and billing errors", () => {
@@ -1031,10 +912,10 @@ describe("createAfterHook() — provider and billing errors (permanent quarantin
     targetAlias: string,
     model: string,
     original: string,
-  ): Map<string, unknown> {
-    const m = new Map<string, unknown>();
-    m.set(callID, { originalSubagentType: original, targetAlias, model });
-    return m;
+  ): AttemptCoordinator {
+    const coordinator = new AttemptCoordinator();
+    coordinator.registerTask({ callID, parentSessionID: "parent", originalSubagentType: original, generatedAlias: targetAlias, originalModel: model, prompt: "" });
+    return coordinator;
   }
 
   function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
@@ -1061,7 +942,7 @@ describe("createAfterHook() — provider and billing errors (permanent quarantin
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -1145,10 +1026,10 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
     targetAlias: string,
     model: string,
     original: string,
-  ): Map<string, unknown> {
-    const m = new Map<string, unknown>();
-    m.set(callID, { originalSubagentType: original, targetAlias, model });
-    return m;
+  ): AttemptCoordinator {
+    const coordinator = new AttemptCoordinator();
+    coordinator.registerTask({ callID, parentSessionID: "parent", originalSubagentType: original, generatedAlias: targetAlias, originalModel: model, prompt: "" });
+    return coordinator;
   }
 
   function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
@@ -1172,7 +1053,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -1197,7 +1078,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -1220,7 +1101,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -1245,7 +1126,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -1269,7 +1150,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -1291,7 +1172,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: new Map(),
+      coordinator: new AttemptCoordinator(),
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -1317,7 +1198,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       audit,
@@ -1332,7 +1213,7 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
     expect(audit).not.toHaveBeenCalled();
     // Tracking entry must still be present — the hook returned before
     // even reaching the tracked-callID lookup, so nothing was consumed.
-    expect(tracking.has("c1")).toBe(true);
+    expect(tracking.tasksByCallID.has("c1")).toBe(true);
   });
 });
 
@@ -1343,8 +1224,9 @@ describe("createAfterHook() — error classification wiring (errorType)", () => 
  * -------------------------------------------------------------------------- */
 
 describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)", () => {
-  it("early-returns (no rewrite) when input.sessionID is already in fallbackSessionIDs", async () => {
-    const fallbackSessionIDs = new Set<string>(["fallback-child-session"]);
+  it("early-returns when input.sessionID is owned by the coordinator", async () => {
+    const coordinator = new AttemptCoordinator();
+    coordinator.markInternalSession("fallback-child-session");
     const audit = vi.fn();
     const hook = createTaskHook(
       {
@@ -1356,7 +1238,7 @@ describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)"
       },
       {
         audit,
-        fallbackSessionIDs,
+        coordinator,
         select: () => decision(),
       },
     );
@@ -1368,8 +1250,9 @@ describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)"
     expect(audit).not.toHaveBeenCalled();
   });
 
-  it("proceeds normally when input.sessionID is NOT in fallbackSessionIDs", async () => {
-    const fallbackSessionIDs = new Set<string>(["some-other-session"]);
+  it("proceeds normally when input.sessionID is not coordinator-owned", async () => {
+    const coordinator = new AttemptCoordinator();
+    coordinator.markInternalSession("some-other-session");
     const hook = createTaskHook(
       {
         mode: "auto",
@@ -1379,7 +1262,7 @@ describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)"
         denylist: [],
       },
       {
-        fallbackSessionIDs,
+        coordinator,
         select: () => decision(),
       },
     );
@@ -1398,10 +1281,10 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
     model: string,
     original: string,
     prompt = "do the thing",
-  ): Map<string, unknown> {
-    const m = new Map<string, unknown>();
-    m.set(callID, { originalSubagentType: original, targetAlias, model, prompt });
-    return m;
+  ): AttemptCoordinator {
+    const coordinator = new AttemptCoordinator();
+    coordinator.registerTask({ callID, parentSessionID: "parent", originalSubagentType: original, generatedAlias: targetAlias, originalModel: model, prompt });
+    return coordinator;
   }
 
   function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): {
@@ -1432,7 +1315,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       fallback: { client, enabled: true },
@@ -1471,7 +1354,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       fallback: { client, enabled: true },
@@ -1497,7 +1380,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       fallback: { client, enabled: false },
@@ -1520,7 +1403,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
     });
@@ -1541,7 +1424,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
     const client = { session: { create: vi.fn(), prompt: vi.fn() } };
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator: tracking,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       fallback: { client, enabled: true },
@@ -1563,7 +1446,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
     // Early-return: tracking entry must NOT have been consumed and
     // nothing quarantined.
-    expect(tracking.has("c1")).toBe(true);
+    expect(tracking.tasksByCallID.has("c1")).toBe(true);
     expect(quarantine.snapshot()).toEqual([]);
   });
 });
