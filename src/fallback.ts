@@ -42,6 +42,7 @@ import type { QuarantineErrorType, QuarantineStore } from "./quarantine.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
+import type { AttemptCoordinator } from "./attempt-coordinator.js";
 import {
   classifySdkResult,
   type AttemptOutcome,
@@ -137,6 +138,18 @@ export interface FallbackEngineDeps {
   sessionCreateTimeoutMs?: number;
   now?: () => Date;
   logger?: Logger;
+  /**
+   * supervised-model-fallback-recovery (SDD change) — PR-04b.
+   * When supplied, the engine registers every child session it creates
+   * with `coordinator.markInternalSession(sessionID)` BEFORE
+   * `session.prompt` fires, and tombstones it via
+   * `coordinator.unmarkInternalSession(sessionID)` after the prompt
+   * settles (success/failure). Production wiring (`plugin.ts`) always
+   * supplies a coordinator; legacy callers/tests that pre-date PR-04b
+   * keep working — the engine's internal `fallbackSessionIDs` Set
+   * remains the bookkeeping surface for that path.
+   */
+  coordinator?: AttemptCoordinator;
 }
 
 export interface FallbackRunParams {
@@ -301,7 +314,7 @@ function reasonForOutcome(outcome: AttemptOutcome): string {
 }
 
 export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
-  const { quarantine, catalog, ladder, logger } = deps;
+  const { quarantine, catalog, ladder, logger, coordinator } = deps;
   const maxAttempts = deps.maxAttempts ?? MAX_TOTAL_ATTEMPTS;
   const sessionCreateTimeoutMs = deps.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
   const nowFn = deps.now ?? ((): Date => new Date());
@@ -310,10 +323,42 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const attemptedProviders = new Set<string>();
   const providerHadError = new Set<string>();
 
-  function tombstone(sessionId: string): void {
+  // supervised-model-fallback-recovery (SDD change) — PR-04b.
+  // When a coordinator is wired, mirror the engine's
+  // mark/unmark lifecycle into the coordinator's active +
+  // tombstone sets so `coordinator.isInternalSession(sessionID)`
+  // returns true for the duration of the prompt. When no
+  // coordinator is supplied, the engine's local Set is the only
+  // bookkeeping — back-compat with callers/tests that pre-date
+  // PR-04b.
+  function markInternal(sessionId: string): void {
+    fallbackSessionIDs.add(sessionId);
+    if (coordinator !== undefined) {
+      try {
+        coordinator.markInternalSession(sessionId);
+      } catch (err) {
+        logger?.warn(
+          "fallback",
+          `coordinator.markInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  function unmarkInternal(sessionId: string): void {
     fallbackSessionIDs.delete(sessionId);
     tombstoneSessionIDs.add(sessionId);
     scheduleTombstoneEviction(sessionId, tombstoneSessionIDs, nowFn);
+    if (coordinator !== undefined) {
+      try {
+        coordinator.unmarkInternalSession(sessionId);
+      } catch (err) {
+        logger?.warn(
+          "fallback",
+          `coordinator.unmarkInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   function quarantineFailure(outcome: AttemptOutcome, model: string, fallbackReason: string, rawText: string): void {
@@ -441,7 +486,13 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       // nested tool.execute.before/after hook firing for this sessionID
       // (because the fallback session itself dispatches a task tool call)
       // must see this session id as already-fallback-owned.
-      fallbackSessionIDs.add(sessionId);
+      //
+      // PR-04b: when a coordinator is wired, the mark mirrors into
+      // `coordinator.internalSessionIDs` so `coordinator.isInternalSession`
+      // returns true throughout the prompt. The legacy
+      // `fallbackSessionIDs.add(sessionId)` is preserved inside
+      // `markInternal` for back-compat callers/tests.
+      markInternal(sessionId);
 
       const { providerID, modelID } = splitModelId(nextModel);
 
@@ -471,7 +522,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         });
         // Tombstone this session: prompt failed but session id still
         // exists. Move it from active to tombstone.
-        tombstone(sessionId);
+        unmarkInternal(sessionId);
         continue;
       }
 
@@ -491,7 +542,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
           startedAt: attemptStartedAt,
           finishedAt,
         });
-        tombstone(sessionId);
+        unmarkInternal(sessionId);
         return {
           status: "success",
           output: outcome.text,
@@ -527,7 +578,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         startedAt: attemptStartedAt,
         finishedAt,
       });
-      tombstone(sessionId);
+      unmarkInternal(sessionId);
     }
 
     const output = formatExhausted(params.originalSubagentType, attempts);

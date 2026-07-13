@@ -49,11 +49,12 @@ import {
   type GeneratedProfileCatalog,
 } from "./profiles.js";
 import { PHASE_DIFFICULTY, normalizePhase } from "./phases.js";
-import { createAfterHook, createTaskHook, toolID, type TaskHook, type TrackedCall } from "./hooks.js";
+import { createAfterHook, createTaskHook, toolID, type TaskHook } from "./hooks.js";
 import { QuarantineStore, setSharedQuarantineStore } from "./quarantine.js";
 import { loadQuarantineFile } from "./cli-quarantine.js";
 import { loadEffectiveBenchmarks } from "./repo-data.js";
 import { DEFAULT_LADDER } from "./policy.js";
+import { AttemptCoordinator } from "./attempt-coordinator.js";
 import type { HooksConfig, ModelDataCache, SelectionMode } from "./types.js";
 import type { ResolveCandidates } from "./hooks.js";
 
@@ -631,7 +632,15 @@ export default async function modelForecastPlugin(
   // the default per design #1317 §2.
   const quarantineEnabled = options?.quarantine?.enabled !== false;
   const quarantine = new QuarantineStore({ ttlMs: options?.quarantine?.ttlMs, logger });
-  const tracking = new Map<string, TrackedCall>();
+
+  // supervised-model-fallback-recovery (SDD change) — PR-04b.
+  // Coordinator (built in PR-04a) replaces the legacy
+  // `Map<string, TrackedCall>` AND the `fallbackSessionIDs` re-entrancy
+  // guard. One coordinator per plugin instance so multiple instances
+  // stay isolated. Production wiring always passes the coordinator to
+  // both hooks AND the fallback engine — `plugin.ts` no longer reads
+  // `innerAfterHook?.fallbackSessionIDs`.
+  const coordinator = new AttemptCoordinator({ logger });
 
   // Cross-bundle publishing: tsup builds the plugin (`dist/index.js`)
   // and the TUI (`dist/tui.js`) as SEPARATE bundles, so the TUI cannot
@@ -678,15 +687,18 @@ export default async function modelForecastPlugin(
   );
 
   // model-fallback-error-classification (SDD change) — Slice 3, task 22.
-  // Design #1623 "Fallback mechanism" + "Re-entrancy guard". The after
-  // hook is constructed BEFORE the before hook (below) so its
-  // `fallbackSessionIDs` set can be shared into `createTaskHook`'s deps —
-  // both hooks MUST guard against the SAME set of engine-created child
-  // sessions. Gated by `enabled !== false` AND the client actually
-  // exposing usable `session.create`/`session.prompt` methods; the
-  // default is ON only when both hold (rollback plan: `fallback:
-  // {enabled: false}` — or an absent/partial client — restores
-  // pre-Slice-3 audit-only behavior).
+  // Design #1623 "Fallback mechanism" + "Re-entrancy guard".
+  //
+  // PR-04b: the `coordinator` is the canonical registry. Both the
+  // before and after hooks read the re-entrancy guard from
+  // `coordinator.isInternalSession(sessionID)` and the per-callID
+  // task state from `coordinator.tasksByCallID` — the legacy
+  // `Map<string, TrackedCall>` and `fallbackSessionIDs` fields are no
+  // longer part of the production wiring. Gated by `enabled !== false`
+  // AND the client actually exposing usable `session.create`/
+  // `session.prompt` methods; the default is ON only when both hold
+  // (rollback plan: `fallback: {enabled: false}` — or an absent/
+  // partial client — restores pre-Slice-3 audit-only behavior).
   const fallbackClientUsable =
     client !== undefined &&
     typeof client.session?.create === "function" &&
@@ -696,7 +708,7 @@ export default async function modelForecastPlugin(
   if (quarantineEnabled) {
     innerAfterHook = createAfterHook({
       quarantine,
-      tracking,
+      coordinator,
       catalog: profileCatalog,
       ladder: DEFAULT_LADDER,
       logger,
@@ -716,7 +728,6 @@ export default async function modelForecastPlugin(
       },
     });
   }
-  const fallbackSessionIDs = innerAfterHook?.fallbackSessionIDs;
 
   const hooks: Record<string, unknown> = {
     config: async (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
@@ -846,8 +857,7 @@ export default async function modelForecastPlugin(
       createTaskHook(hookConfig, {
         resolveCandidates: options?.resolveCandidates ?? generatedProfileResolver,
         logger,
-        ...(quarantineEnabled ? { tracking } : {}),
-        ...(fallbackSessionIDs !== undefined ? { fallbackSessionIDs } : {}),
+        ...(quarantineEnabled ? { coordinator } : {}),
       }),
       logger,
     ),

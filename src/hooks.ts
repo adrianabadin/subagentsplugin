@@ -60,6 +60,7 @@ import {
   type FallbackClient,
   type FallbackCatalogSlice,
 } from "./fallback.js";
+import type { AttemptCoordinator } from "./attempt-coordinator.js";
 import type { Logger } from "./logger.js";
 import type {
   AuditEntry,
@@ -149,6 +150,12 @@ export interface TaskHookDependencies {
    * after hook reads it to recover the canonical model (the lossy
    * `__mf_…` alias cannot be reversed; see design #1317 R11). When
    * omitted, the hook runs without tracking (no 429 fallback).
+   *
+   * Legacy surface — superseded by `coordinator` in PR-04b. The
+   * coordinator's `tasksByCallID` index is the canonical
+   * per-callID registry; the legacy `Map<string, TrackedCall>` is
+   * kept as a back-compat shim so tests/callers that pre-date the
+   * coordinator keep working unchanged.
    */
   tracking?: Map<string, TrackedCall>;
   /** Test helper: clock for deterministic ISO timestamps. */
@@ -164,13 +171,60 @@ export interface TaskHookDependencies {
    * call dispatched from inside a fallback session can never start a
    * second fallback loop. Omitted when no fallback engine is wired
    * (no re-entrancy risk to guard against).
+   *
+   * Legacy surface — superseded by `coordinator` in PR-04b. When both
+   * are supplied, `coordinator.isInternalSession(sessionID)` wins.
    */
   fallbackSessionIDs?: ReadonlySet<string>;
+  /**
+   * supervised-model-fallback-recovery (SDD change) — PR-04b.
+   * Central state machine that replaces the legacy `tracking` map
+   * AND the `fallbackSessionIDs` re-entrancy guard with a single
+   * source of truth. When supplied:
+   *   - On a switch decision, `registerTask(...)` populates
+   *     `coordinator.tasksByCallID` (the legacy `tracking.set(...)`
+   *     path is skipped).
+   *   - The re-entrancy guard reads `coordinator.isInternalSession(...)`
+   *     (the legacy `fallbackSessionIDs.has(...)` path is skipped).
+   * Omitted for callers/tests that pre-date PR-04b.
+   */
+  coordinator?: AttemptCoordinator;
 }
 
 export function toolID(tool: HookInput["tool"]): string {
   if (typeof tool === "string") return tool;
   return tool?.id ?? tool?.name ?? "";
+}
+
+/**
+ * supervised-model-fallback-recovery (SDD change) — PR-04b.
+ *
+ * Re-entrancy guard shared between the before and after hooks.
+ * Returns `true` iff `sessionID` belongs to a fallback-engine-owned
+ * session that should NOT be re-processed by the current hook:
+ *
+ *   - When a `coordinator` is wired, the canonical check is
+ *     `coordinator.isInternalSession(sessionID)` — it covers both the
+ *     active set AND the tombstone window (so a late event is still
+ *     recognised as fallback-owned and short-circuited).
+ *   - When no coordinator is supplied (back-compat callers/tests),
+ *     fall back to the legacy `fallbackSessionIDs` Set (the engine's
+ *     active-only registry — pre-PR-04b behaviour).
+ *   - When neither is supplied, the hook has nothing to guard against
+ *     and the call proceeds normally.
+ *
+ * Exported for direct unit-testability; not re-exported by `src/api.ts`.
+ */
+export function isReentrantSession(
+  coordinator: AttemptCoordinator | undefined,
+  legacyFallbackSessionIDs: ReadonlySet<string> | undefined,
+  sessionID: string | undefined,
+): boolean {
+  if (sessionID === undefined) return false;
+  if (coordinator !== undefined) {
+    return coordinator.isInternalSession(sessionID);
+  }
+  return legacyFallbackSessionIDs?.has(sessionID) ?? false;
 }
 
 function matchesAllowlist(subagentType: string, allowlist: readonly string[]): boolean {
@@ -422,13 +476,31 @@ export interface AfterHookCatalogSlice {
 
 export interface AfterHookDeps {
   quarantine: QuarantineStore;
-  tracking: Map<string, TrackedCall>;
+  /**
+   * Legacy per-callID tracking map. Read + delete-on-consume on every
+   * classified failure so a single task call triggers a single
+   * quarantine decision.
+   *
+   * Legacy surface — superseded by `coordinator` in PR-04b. When both
+   * are supplied, `coordinator.tasksByCallID` wins.
+   */
+  tracking?: Map<string, TrackedCall>;
   catalog: AfterHookCatalogSlice;
   ladder: readonly LadderRung[];
   audit?: (entry: AuditEntry) => Promise<void> | void;
   warnSink?: (message: string) => void;
   now?: () => Date;
   logger?: Logger;
+  /**
+   * supervised-model-fallback-recovery (SDD change) — PR-04b.
+   * When supplied, the after hook reads/deletes task records from
+   * `coordinator.tasksByCallID` and consults
+   * `coordinator.isInternalSession(...)` for the re-entrancy guard.
+   * Production wiring (`plugin.ts`) always supplies a coordinator;
+   * legacy callers/tests that pre-date PR-04b can keep using
+   * `tracking` alone.
+   */
+  coordinator?: AttemptCoordinator;
   /**
    * model-fallback-error-classification (SDD change) — Slice 3, task 24.
    * Spec #1620 "Recursive Retry With Bounded Attempts". When present, a
@@ -516,9 +588,57 @@ export function findNextViableModel(
 }
 
 export function createAfterHook(deps: AfterHookDeps): AfterHook {
-  const { quarantine, tracking, catalog, ladder, audit, warnSink, now, logger } = deps;
+  const { quarantine, catalog, ladder, audit, warnSink, now, logger, coordinator } = deps;
+  const tracking = deps.tracking;
   const getNow = now ?? ((): Date => new Date());
   const emit = warnSink ?? defaultWarnSink;
+
+  // supervised-model-fallback-recovery (SDD change) — PR-04b.
+  // Resolves a per-callID task record from the coordinator's canonical
+  // `tasksByCallID` index (PR-04a substrate), falling back to the
+  // legacy `tracking` Map when no coordinator is wired. Returns
+  // `null` when neither source has an entry for `callID`.
+  const readTask = (callID: string): {
+    originalSubagentType: string;
+    targetAlias: string;
+    model: string;
+    prompt?: string;
+  } | null => {
+    if (coordinator !== undefined) {
+      const task = coordinator.tasksByCallID.get(callID);
+      if (task === undefined) return null;
+      return {
+        originalSubagentType: task.originalSubagentType,
+        targetAlias: task.generatedAlias,
+        model: task.originalModel,
+        prompt: task.prompt,
+      };
+    }
+    if (tracking !== undefined) {
+      const entry = tracking.get(callID);
+      if (entry === undefined) return null;
+      return {
+        originalSubagentType: entry.originalSubagentType,
+        targetAlias: entry.targetAlias,
+        model: entry.model,
+        prompt: entry.prompt,
+      };
+    }
+    return null;
+  };
+
+  // supervised-model-fallback-recovery (SDD change) — PR-04b.
+  // Delete-on-consume. When the coordinator is wired, delegates to
+  // `tasksByCallID.delete(callID)`; otherwise delegates to the legacy
+  // `tracking` map. Both paths are silent no-ops if the entry was
+  // already consumed by a previous after-hook invocation.
+  const consumeTask = (callID: string): void => {
+    if (coordinator !== undefined) {
+      coordinator.tasksByCallID.delete(callID);
+      return;
+    }
+    tracking?.delete(callID);
+  };
 
   // model-fallback-error-classification (SDD change) — Slice 3, task 24.
   // The engine is constructed ONCE per hook (not per call) so its
@@ -541,6 +661,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
           maxAttempts: 3,
           now,
           logger,
+          ...(coordinator !== undefined ? { coordinator } : {}),
         })
       : undefined;
 
@@ -549,20 +670,27 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     // Re-entrancy guard (design #1623 "Re-entrancy guard"): a task call
     // completing inside a session the fallback engine itself created
     // must never re-trigger classification/quarantine/fallback.
-    if (
-      fallbackEngine !== undefined &&
-      input.sessionID !== undefined &&
-      fallbackEngine.fallbackSessionIDs.has(input.sessionID)
-    ) {
+    //
+    // PR-04b: when a coordinator is wired, the canonical guard is
+    // `coordinator.isInternalSession(sessionID)` (covers both the
+    // active set and the tombstone window). The legacy
+    // `fallbackEngine.fallbackSessionIDs` path remains as a back-compat
+    // shim for callers/tests that pre-date the coordinator.
+    // Re-entrancy guard (design #1623 "Re-entrancy guard"): a task call
+    // completing inside a session the fallback engine itself created
+    // must never re-trigger classification/quarantine/fallback. The
+    // shared helper handles both the canonical coordinator path and
+    // the legacy `fallbackEngine.fallbackSessionIDs` back-compat path.
+    if (isReentrantSession(coordinator, fallbackEngine?.fallbackSessionIDs, input.sessionID)) {
       return;
     }
     const callID = input.callID ?? "";
     if (callID.length === 0) return;
-    const tracked = tracking.get(callID);
-    if (tracked === undefined) return;
+    const tracked = readTask(callID);
+    if (tracked === null) return;
     // Delete-on-consume: a single task call triggers a single quarantine
     // decision. Re-entry with the same callID is silent.
-    tracking.delete(callID);
+    consumeTask(callID);
 
     if (parseGeneratedAlias(tracked.targetAlias) === null) return;
 
@@ -594,7 +722,10 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
         { source: "text", value: text },
       ], Date.now())
       : undefined;
-    const ttlMs = resolveQuarantineTtlMs({ errorType, ttlHintMs: rateLimitTtlMs });
+const ttlMs = resolveQuarantineTtlMs({
+      errorType,
+      ttlHintMs: rateLimitTtlMs,
+    });
     const entry = errorType === "rate_limit"
       ? quarantine.addAutomaticRateLimit(tracked.model, reason, ttlMs!)[0]!
       : errorType === "model_not_configured"
@@ -702,7 +833,20 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     }
   }) as AfterHook;
 
-  hook.fallbackSessionIDs = fallbackEngine?.fallbackSessionIDs;
+  // PR-04b: when a coordinator is wired, surface the union of
+  // `coordinator.internalSessionIDs` AND `internalSessionTombstones`
+  // via the legacy `fallbackSessionIDs` field so back-compat callers
+  // (e.g. tests/hooks.test.ts:1549) keep working. Without a
+  // coordinator, fall back to the engine's own internal set.
+  if (coordinator !== undefined) {
+    const legacySet = new Set<string>(coordinator.internalSessionIDs);
+    for (const tombId of coordinator.internalSessionTombstones.keys()) {
+      legacySet.add(tombId);
+    }
+    hook.fallbackSessionIDs = legacySet;
+  } else {
+    hook.fallbackSessionIDs = fallbackEngine?.fallbackSessionIDs;
+  }
 
   return hook;
 }
@@ -736,11 +880,9 @@ export function createTaskHook(
     // model-fallback-error-classification (SDD change) — Slice 3, task 24.
     // Re-entrancy guard: a task call dispatched from inside a session the
     // fallback engine created must never itself start a fallback loop.
-    if (
-      deps.fallbackSessionIDs !== undefined &&
-      input.sessionID !== undefined &&
-      deps.fallbackSessionIDs.has(input.sessionID)
-    ) {
+    // The shared helper handles both the canonical coordinator path
+    // (PR-04b) and the legacy `deps.fallbackSessionIDs` back-compat path.
+    if (isReentrantSession(deps.coordinator, deps.fallbackSessionIDs, input.sessionID)) {
       return;
     }
 
@@ -846,17 +988,49 @@ export function createTaskHook(
       // the canonical `provider/model-id` (the alias is lossy; see
       // design #1317 R11). FIFO-bounded to 1000 entries (R13) to keep
       // long sessions bounded.
-      if (deps.tracking !== undefined && callID.length > 0) {
-        if (deps.tracking.size >= 1000) {
-          const oldest = deps.tracking.keys().next();
-          if (!oldest.done) deps.tracking.delete(oldest.value);
+      //
+      // PR-04b: when a coordinator is wired, delegate to
+      // `coordinator.registerTask(...)` (the canonical registry per
+      // PR-04a §PR-04 item 2.1 + item 4). The coordinator's
+      // `MAX_ACTIVE_TASKS = 1000` cap replaces the legacy in-place
+      // FIFO eviction. The legacy `tracking.set(...)` path remains as
+      // a back-compat shim for callers/tests that pre-date the
+      // coordinator.
+      if (callID.length > 0) {
+        if (deps.coordinator !== undefined) {
+          try {
+            deps.coordinator.registerTask({
+              callID,
+              parentSessionID: input.sessionID ?? "",
+              originalSubagentType: original,
+              generatedAlias: finalDecision.subagent_type,
+              originalModel: finalDecision.model,
+              prompt: typeof output.args.prompt === "string" ? output.args.prompt : "",
+            });
+          } catch (err) {
+            // registerTask throws on duplicate callID or capacity
+            // overflow. The before-hook's `handledCallIds` set already
+            // suppresses duplicate callIDs in the same plugin process;
+            // capacity overflow here would mean ~1000 active tasks in
+            // the same session — log and fall through so the rewrite
+            // itself still applies.
+            logger?.warn(
+              "createTaskHook",
+              `coordinator.registerTask failed for ${callID}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        } else if (deps.tracking !== undefined) {
+          if (deps.tracking.size >= 1000) {
+            const oldest = deps.tracking.keys().next();
+            if (!oldest.done) deps.tracking.delete(oldest.value);
+          }
+          deps.tracking.set(callID, {
+            originalSubagentType: original,
+            targetAlias: finalDecision.subagent_type,
+            model: finalDecision.model,
+            prompt: typeof output.args.prompt === "string" ? output.args.prompt : undefined,
+          });
         }
-        deps.tracking.set(callID, {
-          originalSubagentType: original,
-          targetAlias: finalDecision.subagent_type,
-          model: finalDecision.model,
-          prompt: typeof output.args.prompt === "string" ? output.args.prompt : undefined,
-        });
       }
     } else if (refusedReason !== null) {
       logger?.warn(
