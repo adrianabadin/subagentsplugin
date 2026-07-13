@@ -4,6 +4,7 @@ import { createAfterHook, createTaskHook, detectRateLimit, parseGeneratedAlias, 
 import { QuarantineStore, type QuarantineBlocklist } from "../src/quarantine.js";
 import { generatedProfileAlias } from "../src/profiles.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
+import { AttemptCoordinator } from "../src/attempt-coordinator.js";
 import type { AuditEntry, LadderRung, SelectDecision } from "../src/types.js";
 
 function decision(overrides: Partial<SelectDecision> = {}): SelectDecision {
@@ -1531,7 +1532,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
     expect(output.output).toBe("upstream returned HTTP 429 Too Many Requests");
   });
 
-  it("exposes fallbackSessionIDs on the returned hook function and early-returns when input.sessionID is fallback-owned", async () => {
+  it("uses the coordinator to early-return when input.sessionID is fallback-owned", async () => {
     const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
     const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
     const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
@@ -1546,11 +1547,19 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
       fallback: { client, enabled: true },
     });
 
-    expect(hook.fallbackSessionIDs).toBeInstanceOf(Set);
-    hook.fallbackSessionIDs!.add("fallback-child");
+    const coordinator = new AttemptCoordinator();
+    coordinator.markInternalSession("fallback-child");
+
+    const coordinatedHook = createAfterHook({
+      quarantine,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: true },
+      coordinator,
+    });
 
     const output: { output?: unknown } = { output: "HTTP 429" };
-    await hook({ tool: { id: "task" }, sessionID: "fallback-child", callID: "c1" }, output);
+    await coordinatedHook({ tool: { id: "task" }, sessionID: "fallback-child", callID: "c1" }, output);
 
     // Early-return: tracking entry must NOT have been consumed and
     // nothing quarantined.

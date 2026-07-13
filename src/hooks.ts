@@ -873,21 +873,6 @@ const ttlMs = resolveQuarantineTtlMs({
     }
   }) as AfterHook;
 
-  // PR-04b: when a coordinator is wired, surface the union of
-  // `coordinator.internalSessionIDs` AND `internalSessionTombstones`
-  // via the legacy `fallbackSessionIDs` field so back-compat callers
-  // (e.g. tests/hooks.test.ts:1549) keep working. Without a
-  // coordinator, fall back to the engine's own internal set.
-  if (coordinator !== undefined) {
-    const legacySet = new Set<string>(coordinator.internalSessionIDs);
-    for (const tombId of coordinator.internalSessionTombstones.keys()) {
-      legacySet.add(tombId);
-    }
-    hook.fallbackSessionIDs = legacySet;
-  } else {
-    hook.fallbackSessionIDs = fallbackEngine?.fallbackSessionIDs;
-  }
-
   return hook;
 }
 

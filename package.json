@@ -1,7 +1,7 @@
 {
   "name": "@aabadin/opencode-model-forecast",
-  "version": "0.2.0",
-  "description": "Model + effort forecast plugin for OpenCode: caches provider/model/benchmark data at startup and recommends a model per SDD phase via a CLI + orchestrator skill. Adds generated-profile routing, selection policy, and 429 fallback quarantine (60-min TTL) for auto mode.",
+  "version": "0.3.0",
+  "description": "Model + effort forecast plugin for OpenCode with supervised multi-provider fallback recovery.",
   "type": "module",
   "private": false,
   "main": "./dist/index.js",
@@ -13,13 +13,6 @@
     "./api": {
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
-    },
-    "./cli": {
-      "import": "./dist/cli.js"
-    },
-    "./tui": {
-      "types": "./dist/tui.d.ts",
-      "import": "./dist/tui.js"
     }
   },
   "bin": {

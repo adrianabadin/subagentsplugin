@@ -1,13 +1,13 @@
 # @aabadin/opencode-model-forecast
 
-Model + effort forecast plugin for [OpenCode](https://opencode.ai): caches provider/model/benchmark data at startup, recommends a model per SDD phase, and (in auto mode) routes the next subagent phase to the cheapest viable rung on the cost ladder. Adds a **429 fallback quarantine** layer that, on rate limit, marks a model as unavailable for a configurable TTL (default 60 min) and auto-selects the next viable rung on subsequent tasks of the same phase.
+Model + effort forecast plugin for [OpenCode](https://opencode.ai): caches provider/model/benchmark data at startup, recommends a model per SDD phase, and (in auto mode) supervises failed subagents with bounded multi-provider fallback recovery. Rate-limit quarantines use a reset signal when available and otherwise last 10 minutes.
 
 ## Features
 
 - **Forecast engine** — pure `forecast(input)` returns `{ model, effort, reasoning, fallback }`. Verbose mode additively exposes evidence, confidence, and alternatives.
 - **Generated profiles** — at session start (auto mode), the plugin generates one hidden `__mf_<base>__<model>_<hash>` agent per base SDD phase × connected model, in-memory via the OpenCode `config` hook. Prompts and permissions are preserved; only `model` changes.
 - **Selection policy** — opt-in auto mode rewrites `task.subagent_type` to the cheapest viable rung that meets the confidence threshold. Threshold + ladder are configurable.
-- **429 fallback quarantine** (new in 0.2.0) — when a subagent task output matches a known rate-limit pattern (`usage_limit_reached`, `HTTP 429`, `AI_APICallError: ...`, `\b429\b`, etc.), the model is quarantined for the configured TTL. Subsequent tasks of the same phase auto-skip that rung. Audit entry + stderr warning with the next viable model.
+- **Supervised fallback recovery** — authoritative rate limits, model configuration errors, empty output, and provider failures are recovered through at most three total attempts. The coordinator owns task/session lifecycle, cancels hung attempts, and returns either fallback output or an explicit exhausted result.
 - **CLI** — `model-forecast --phase <phase> [--verbose] [--diff-lines N] [--risk-domain ...]` for offline forecasting.
 - **Loader-clean** — plugin root is a single default export; OpenCode accepts the package directly.
 
@@ -76,7 +76,7 @@ OpenCode scans the project's `node_modules` and loads the plugin from there.
 | `generatedProfiles.phasePrefixes` | string[] | `["sdd-"]` | Phase prefixes used to generate per-phase profile aliases. |
 | `generatedProfiles.enabled` | boolean | `true` | Master switch for generated-profile routing. |
 | `quarantine.enabled` | boolean | `true` (when `mode === "auto"`) | Enable the 429 fallback quarantine. Set `false` to skip the after hook entirely. |
-| `quarantine.ttlMs` | number | `3600000` (60 min) | Time-to-live for a quarantined model. |
+| `quarantine.ttlMs` | number | `600000` (10 min) | Default time-to-live for a quarantined model without a reset signal. Valid reset-derived values are clamped to 1 second through 24 hours. |
 | `recovery.enabled` | boolean | `true` (when `mode === "auto"`) | Enable supervised recovery, watchdogs, and parent recovery without disabling model selection. |
 | `recovery.timeouts.INACTIVITY_TIMEOUT_MS` | number | `180000` | Override the inactivity watchdog for reasoning models that do not emit OpenCode activity heartbeats. |
 
@@ -179,12 +179,13 @@ Requires Node `>=24 <25` and OpenCode `>=1.17.11`.
 - `src/plugin.ts` — plugin implementation; `modelForecastPlugin(input, options)` returns hooks or `{}`.
 - `src/api.ts` — public API barrel (`forecast`, `refreshCache`, scoring, evidence, types).
 - `src/quarantine.ts` — `QuarantineStore` (TTL-keyed, idempotent add, injectable clock).
-- `src/hooks.ts` — `createTaskHook`, `createAfterHook`, `detectRateLimit`, `parseGeneratedAlias`.
+- `src/hooks.ts` — coordinator-backed task and after hooks.
+- `src/attempt-coordinator.ts` — single owner of recovery task, session, tombstone, and timer lifecycle.
 - `src/profiles.ts` — generated-profile catalog + `createGeneratedProfileResolver` (with optional quarantine filter).
 - `src/select.ts`, `src/scoring.ts`, `src/evidence.ts` — selection engine.
 - `src/policy.ts` — default cost ladder (`minimax → google-antigravity → openai → glm-5.2 → anthropic`).
 - `src/audit.ts` — non-throwing audit sink.
-- `dist/` — ESM build (tsup) with `.d.ts` for `./api` and `.`.
+- `dist/` — ESM build. The package publishes only the default plugin root export and the `./api` programmatic surface.
 
 ## License
 

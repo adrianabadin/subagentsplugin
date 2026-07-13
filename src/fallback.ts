@@ -25,13 +25,9 @@
  * surfaces a structured terminal error on exhaustion — NEVER a silent
  * empty output.
  *
- * Re-entrancy: every child session the engine creates is registered in
- * `fallbackSessionIDs` (active set) BEFORE `session.prompt` is called
- * and moved to `tombstoneSessionIDs` (with a five-minute TTL) when its
- * prompt resolves. Nested `tool.execute.before` / `tool.execute.after`
- * hooks firing for that session can early-return. Late events that
- * arrive after the tombstone window expires are no longer recognised
- * as fallback-owned.
+ * Re-entrancy ownership belongs exclusively to `AttemptCoordinator`.
+ * Every child session is registered before prompting and tombstoned when
+ * the prompt settles, so nested and late hook events can be rejected.
  *
  * The cancelled variant of `FallbackResult` is declared for forward
  * compatibility with PR-07's cancellation handling; the engine does not
@@ -107,13 +103,9 @@ export interface FallbackCancelledResult {
 
 export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult | FallbackCancelledResult;
 
-/**
- * Structural shape of the OpenCode SDK client surface that the engine needs.
- */
 export interface FallbackClient {
   session?: OpenCodeSessionClient;
 }
-
 /**
  * Minimal shape of a `GeneratedProfileCatalog` slice needed to compute
  * `findNextViableModel` — deliberately duplicated (not imported) from
@@ -130,8 +122,7 @@ export interface FallbackEngineDeps {
   catalog: FallbackCatalogSlice;
   ladder: readonly LadderRung[];
   /**
-   * @deprecated Use `classify` injected below. Kept for backward
-   * compatibility with existing tests that pre-date PR-03.
+   * Error classifier for the original task output.
    */
   classify: (text: string) => null | { type: string; code: string; rawExcerpt?: string };
   /** Hard cap on TOTAL attempts (including the one that triggered the call). Default: `MAX_TOTAL_ATTEMPTS`. */
@@ -144,14 +135,7 @@ export interface FallbackEngineDeps {
   logger?: Logger;
   /**
    * supervised-model-fallback-recovery (SDD change) — PR-04b.
-   * When supplied, the engine registers every child session it creates
-   * with `coordinator.markInternalSession(sessionID)` BEFORE
-   * `session.prompt` fires, and tombstones it via
-   * `coordinator.unmarkInternalSession(sessionID)` after the prompt
-   * settles (success/failure). Production wiring (`plugin.ts`) always
-   * supplies a coordinator; legacy callers/tests that pre-date PR-04b
-   * keep working — the engine's internal `fallbackSessionIDs` Set
-   * remains the bookkeeping surface for that path.
+   * Central coordinator that owns every recovery session lifecycle.
    */
   coordinator?: AttemptCoordinator;
 }
@@ -172,9 +156,7 @@ export interface FallbackRunParams {
 }
 
 export interface FallbackEngine {
-  /** Session ids currently being prompted — shared re-entrancy guard for before/after hooks. */
   fallbackSessionIDs: Set<string>;
-  /** Session ids whose prompt has settled, kept for late-event rejection (INV-010). Cleared after TTL. */
   tombstoneSessionIDs: Set<string>;
   run: (params: FallbackRunParams) => Promise<FallbackResult>;
 }
@@ -297,23 +279,6 @@ function formatExhausted(base: string, attempts: readonly FallbackAttempt[]): st
  * `COMPLETED_TASK_TOMBSTONE_MS` constant already exposed in
  * `recovery-policy.ts`).
  */
-const TOMBSTONE_TTL_MS = 5 * 60 * 1_000;
-
-function scheduleTombstoneEviction(
-  sessionId: string,
-  tombstones: Set<string>,
-  nowFn: () => Date,
-): void {
-  const timer = setTimeout(() => {
-    tombstones.delete(sessionId);
-  }, TOMBSTONE_TTL_MS);
-  timer.unref?.();
-  // nowFn is consumed only to anchor the eviction decision if needed in
-  // future (e.g. for fake-clock injection); mark it referenced to keep
-  // the parameter live without forcing a no-op call.
-  void nowFn;
-}
-
 function reasonForOutcome(outcome: AttemptOutcome): string {
   if (outcome.kind === "success") return "success";
   return outcome.reason;
@@ -330,41 +295,30 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const attemptedProviders = new Set<string>();
   const providerHadError = new Set<string>();
 
-  // supervised-model-fallback-recovery (SDD change) — PR-04b.
-  // When a coordinator is wired, mirror the engine's
-  // mark/unmark lifecycle into the coordinator's active +
-  // tombstone sets so `coordinator.isInternalSession(sessionID)`
-  // returns true for the duration of the prompt. When no
-  // coordinator is supplied, the engine's local Set is the only
-  // bookkeeping — back-compat with callers/tests that pre-date
-  // PR-04b.
   function markInternal(sessionId: string, taskCallID: string | undefined): void {
     fallbackSessionIDs.add(sessionId);
-    if (coordinator !== undefined) {
-      try {
-        coordinator.markInternalSession(sessionId, taskCallID);
-      } catch (err) {
-        logger?.warn(
-          "fallback",
-          `coordinator.markInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+    if (coordinator === undefined) return;
+    try {
+      coordinator.markInternalSession(sessionId, taskCallID);
+    } catch (err) {
+      logger?.warn(
+        "fallback",
+        `coordinator.markInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
   function unmarkInternal(sessionId: string): void {
     fallbackSessionIDs.delete(sessionId);
     tombstoneSessionIDs.add(sessionId);
-    scheduleTombstoneEviction(sessionId, tombstoneSessionIDs, nowFn);
-    if (coordinator !== undefined) {
-      try {
-        coordinator.unmarkInternalSession(sessionId);
-      } catch (err) {
-        logger?.warn(
-          "fallback",
-          `coordinator.unmarkInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+    if (coordinator === undefined) return;
+    try {
+      coordinator.unmarkInternalSession(sessionId);
+    } catch (err) {
+      logger?.warn(
+        "fallback",
+        `coordinator.unmarkInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
