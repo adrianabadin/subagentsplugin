@@ -675,6 +675,16 @@ export class AttemptCoordinator {
     return task;
   }
 
+  /** Marks a recovery prompt once, unless an after hook or cancellation won. */
+  markParentRecoveryEnqueued(callID: string, now?: number): boolean {
+    this.assertAlive();
+    const task = this.tasksByCallID.get(callID);
+    if (task === undefined || task.userCancelled || task.parentRecoveryEnqueued || task.afterHookSeen) return false;
+    task.parentRecoveryEnqueued = true;
+    transitionTask(task, "parent-recovery-enqueued", now ?? this.nowFn());
+    return true;
+  }
+
   // -------------------------------------------------------------------------
   // Cleanup / tombstones
   // -------------------------------------------------------------------------

@@ -60,6 +60,7 @@ import { DEFAULT_LADDER } from "./policy.js";
 import { AttemptCoordinator } from "./attempt-coordinator.js";
 import { AttemptWatchdog, type AttemptWatchdogTimeouts } from "./attempt-watchdog.js";
 import { safeAbortSession } from "./session-abort.js";
+import { ParentRecovery } from "./parent-recovery.js";
 import type { HooksConfig, ModelDataCache, SelectionMode } from "./types.js";
 import type { ResolveCandidates } from "./hooks.js";
 import type { AttemptFailure } from "./recovery-types.js";
@@ -647,6 +648,7 @@ export default async function modelForecastPlugin(
   // both hooks AND the fallback engine — `plugin.ts` no longer reads
   // `innerAfterHook?.fallbackSessionIDs`.
   const coordinator = new AttemptCoordinator({ logger });
+  const parentRecovery = new ParentRecovery({ coordinator, client: client?.session });
   let watchdog: AttemptWatchdog | undefined;
   const recoveryEnabled = options?.recovery?.enabled !== false;
 
@@ -735,6 +737,7 @@ export default async function modelForecastPlugin(
     innerAfterHook = createAfterHook({
       quarantine,
       coordinator,
+      parentRecovery,
       catalog: profileCatalog,
       ladder: DEFAULT_LADDER,
       logger,
@@ -989,6 +992,7 @@ export default async function modelForecastPlugin(
 
     const eventHook = createEventHook({
       coordinator,
+      parentRecovery,
       ...(client !== undefined ? { client: { session: client.session } } : {}),
       logger,
       watchdog: activeWatchdog,

@@ -153,5 +153,6 @@ export type AbortOrigin =
   | "plugin-authoritative-error"
   | "plugin-watchdog"
   | "plugin-cleanup"
+  | "plugin-parent-recovery"
   | "user"
   | "external";

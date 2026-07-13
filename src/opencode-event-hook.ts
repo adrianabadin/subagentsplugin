@@ -31,6 +31,7 @@ import type { AttemptWatchdog } from "./attempt-watchdog.js";
 import type { FallbackResult } from "./fallback.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
+import type { ParentRecovery } from "./parent-recovery.js";
 import { safeAbortSession } from "./session-abort.js";
 import type { AttemptFailure, FailureSource, TrackedTask } from "./recovery-types.js";
 import {
@@ -71,6 +72,8 @@ export interface EventHookDeps {
    * pure/test path.
    */
   startFallback?: (task: TrackedTask, failure: AuthoritativeFailure) => Promise<FallbackResult>;
+  /** PR-08 continuation guard started after an authoritative failure claim. */
+  parentRecovery?: ParentRecovery;
 }
 
 export type EventHook = (input: { event?: unknown }) => Promise<void>;
@@ -114,7 +117,7 @@ function childInfoFor(result: unknown, sessionID: string): AssociationEventInfo 
 // ---------------------------------------------------------------------------
 
 export function createEventHook(deps: EventHookDeps): EventHook {
-  const { coordinator, client, logger, watchdog } = deps;
+  const { coordinator, client, logger, watchdog, parentRecovery } = deps;
   const nowFn = deps.now ?? ((): number => Date.now());
   const startFallback = deps.startFallback;
   // P-02: sessions whose first ≤60s-reset 429 has already been tolerated.
@@ -305,6 +308,7 @@ export function createEventHook(deps: EventHookDeps): EventHook {
     });
     // Duplicate / late / terminal → the first claimer already acted.
     if (!claim.claimed) return;
+    parentRecovery?.schedule(task.callID);
     if (startFallback === undefined) return;
 
     let promise: Promise<FallbackResult>;

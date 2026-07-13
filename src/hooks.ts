@@ -61,6 +61,7 @@ import {
   type FallbackCatalogSlice,
 } from "./fallback.js";
 import type { AttemptCoordinator } from "./attempt-coordinator.js";
+import type { ParentRecovery } from "./parent-recovery.js";
 import { decideOriginalResult } from "./recovery-arbitration.js";
 import type { Logger } from "./logger.js";
 import type {
@@ -504,6 +505,8 @@ export interface AfterHookDeps {
    * `tracking` alone.
    */
   coordinator?: AttemptCoordinator;
+  /** PR-08 continuation guard for an after hook that never arrives. */
+  parentRecovery?: ParentRecovery;
   /**
    * model-fallback-error-classification (SDD change) — Slice 3, task 24.
    * Spec #1620 "Recursive Retry With Bounded Attempts". When present, a
@@ -591,7 +594,7 @@ export function findNextViableModel(
 }
 
 export function createAfterHook(deps: AfterHookDeps): AfterHook {
-  const { quarantine, catalog, ladder, audit, warnSink, now, logger, coordinator } = deps;
+  const { quarantine, catalog, ladder, audit, warnSink, now, logger, coordinator, parentRecovery } = deps;
   const tracking = deps.tracking;
   const getNow = now ?? ((): Date => new Date());
   const emit = warnSink ?? defaultWarnSink;
@@ -688,6 +691,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     }
     const callID = input.callID ?? "";
     if (callID.length === 0) return;
+    parentRecovery?.noteAfter(callID);
     const tracked = readTask(callID);
     if (tracked === null) return;
     const text = typeof output.output === "string" ? output.output : "";
@@ -810,6 +814,7 @@ const ttlMs = resolveQuarantineTtlMs({
         source: "tool-after",
       });
       if (!claim.claimed) return;
+      parentRecovery?.schedule(callID);
     }
     const fallbackRun = fallbackEngine.run({
       sessionID: input.sessionID ?? "",
