@@ -50,6 +50,9 @@ import {
 } from "./profiles.js";
 import { PHASE_DIFFICULTY, normalizePhase } from "./phases.js";
 import { createAfterHook, createTaskHook, toolID, type TaskHook } from "./hooks.js";
+import { createFallbackEngine } from "./fallback.js";
+import { classifyError } from "./error-classification.js";
+import { createEventHook } from "./opencode-event-hook.js";
 import { QuarantineStore, setSharedQuarantineStore } from "./quarantine.js";
 import { loadQuarantineFile } from "./cli-quarantine.js";
 import { loadEffectiveBenchmarks } from "./repo-data.js";
@@ -880,6 +883,67 @@ export default async function modelForecastPlugin(
       }
     };
   }
+
+  // supervised-model-fallback-recovery (SDD change) — PR-05.
+  // Register the OpenCode `event` hook for early failure detection.
+  // Gated by `recovery.enabled !== false` (amendment P-06); default ON.
+  // The event hook normalizes session/message/permission events (C-02),
+  // associates child sessions to tracked tasks (§14), and — on an
+  // authoritative 429 / provider / model failure — creates the
+  // `fallbackPromise` BEFORE `tool.execute.after` fires (§PR-05 merge
+  // gate). It NEVER aborts a session and starts NO watchdog (design
+  // items 10 + 11). It uses a dedicated bounded fallback engine that
+  // shares the coordinator + quarantine + catalog so internal-session
+  // bookkeeping stays consistent with the after hook.
+  const recoveryEnabled = options?.recovery?.enabled !== false;
+  if (recoveryEnabled) {
+    const eventFallbackEngine =
+      fallbackEnabled && client !== undefined
+        ? createFallbackEngine({
+            client: { session: client.session },
+            quarantine,
+            catalog: profileCatalog,
+            ladder: DEFAULT_LADDER,
+            classify: classifyError,
+            maxAttempts: 3,
+            logger,
+            coordinator,
+          })
+        : undefined;
+
+    const eventHook = createEventHook({
+      coordinator,
+      ...(client !== undefined ? { client: { session: client.session } } : {}),
+      logger,
+      ...(eventFallbackEngine !== undefined
+        ? {
+            startFallback: (task, failure) =>
+              eventFallbackEngine.run({
+                sessionID: task.parentSessionID,
+                originalSubagentType: task.originalSubagentType,
+                prompt: task.prompt,
+                failedModel: task.originalModel,
+                failureReason: failure.code,
+              }),
+          }
+        : {}),
+    });
+
+    // Register safely — the event hook is best-effort internally, but a
+    // second guard here guarantees a thrown/rejected handler can never
+    // surface to OpenCode's event dispatcher.
+    hooks["event"] = async (input: { event?: unknown }): Promise<void> => {
+      try {
+        await eventHook(input);
+      } catch (err) {
+        logger.warn(
+          "event",
+          `event hook registration guard absorbed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+  }
+
   return hooks;
 }
 

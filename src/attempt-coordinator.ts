@@ -234,6 +234,16 @@ export class AttemptCoordinator {
   readonly tasksByCallID = new Map<string, TrackedTask>();
   readonly attemptsByID = new Map<string, ModelAttempt>();
   readonly attemptsBySessionID = new Map<string, string>();
+  /**
+   * supervised-model-fallback-recovery (SDD change) — PR-05 §14.
+   * Task-level child-session association: child `sessionID` → owning
+   * task `callID`. Populated by `bindTaskSession` when the event hook
+   * resolves a `session.created` event to a tracked task (§14.4). The
+   * original attempt is not registered by the before hook (PR-04b), so
+   * binding is recorded at the TASK level here rather than via
+   * `bindSession` (which requires a `ModelAttempt`).
+   */
+  readonly callIDBySessionID = new Map<string, string>();
   readonly pendingOriginalByParentID = new Map<string, string[]>();
   readonly tasksByParentSessionID = new Map<string, string[]>();
   readonly pluginAbortSessionIDs = new Map<string, PluginAbortRecord>();
@@ -693,6 +703,52 @@ export class AttemptCoordinator {
   }
 
   // -------------------------------------------------------------------------
+  // PR-05 §14: task-level child-session association
+  // -------------------------------------------------------------------------
+
+  /**
+   * Associate a child `sessionID` with a tracked task (design §14.4).
+   * Records the `sessionID → callID` mapping and promotes the task
+   * through `registered → awaiting-child → running-original` (§6.3) so
+   * the state machine reflects that the child session is live. Terminal
+   * tasks are never resurrected. Returns the task (or `undefined` when
+   * the callID is unknown).
+   *
+   * The original attempt is NOT registered by the before hook (PR-04b),
+   * so binding lives at the task level here — `bindSession` (which needs
+   * a `ModelAttempt`) is reserved for the watchdog wiring that lands in
+   * PR-06.
+   */
+  bindTaskSession(input: { callID: string; sessionID: string; now?: number }): TrackedTask | undefined {
+    this.assertAlive();
+    const task = this.tasksByCallID.get(input.callID);
+    if (task === undefined) {
+      this.logInvalidTransition(input.callID, `bindTaskSession on unknown callID`);
+      return undefined;
+    }
+    if (TERMINAL_TASK_STATES.has(task.state)) {
+      this.logInvalidTransition(task.callID, `bindTaskSession on terminal task (state=${task.state})`);
+      return task;
+    }
+    const now = input.now ?? this.nowFn();
+    this.callIDBySessionID.set(input.sessionID, input.callID);
+    if (task.state === "registered") {
+      transitionTask(task, "awaiting-child", now);
+    }
+    if (task.state === "awaiting-child") {
+      transitionTask(task, "running-original", now);
+    }
+    return task;
+  }
+
+  /** Resolve the tracked task bound to a child `sessionID` (or undefined). */
+  taskForSession(sessionID: string): TrackedTask | undefined {
+    const callID = this.callIDBySessionID.get(sessionID);
+    if (callID === undefined) return undefined;
+    return this.tasksByCallID.get(callID);
+  }
+
+  // -------------------------------------------------------------------------
   // Amendment C-05: failure-claimed → fallback-exhausted
   // -------------------------------------------------------------------------
 
@@ -797,6 +853,7 @@ export class AttemptCoordinator {
     this.tasksByCallID.clear();
     this.attemptsByID.clear();
     this.attemptsBySessionID.clear();
+    this.callIDBySessionID.clear();
     this.pendingOriginalByParentID.clear();
     this.tasksByParentSessionID.clear();
     this.pluginAbortSessionIDs.clear();

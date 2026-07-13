@@ -223,8 +223,11 @@ describe("plugin — 429-fallback gating", () => {
       mode: "auto",
       quarantine: { filePath: path.join(tempDir, "quarantine.json") },
     });
+    // PR-05 (supervised-model-fallback-recovery): the `event` hook is
+    // registered in auto mode with recovery enabled (default).
     expect(Object.keys(hooks).sort()).toEqual([
       "config",
+      "event",
       "tool.execute.after",
       "tool.execute.before",
     ]);
@@ -235,7 +238,9 @@ describe("plugin — 429-fallback gating", () => {
       mode: "auto",
       quarantine: { enabled: false },
     });
-    expect(Object.keys(hooks).sort()).toEqual(["config", "tool.execute.before"]);
+    // The `event` hook (PR-05) is gated by recovery, not quarantine, so
+    // it is still present here.
+    expect(Object.keys(hooks).sort()).toEqual(["config", "event", "tool.execute.before"]);
     expect(hooks).not.toHaveProperty("tool.execute.after");
   });
 
@@ -246,6 +251,7 @@ describe("plugin — 429-fallback gating", () => {
     });
     expect(Object.keys(hooks).sort()).toEqual([
       "config",
+      "event",
       "tool.execute.after",
       "tool.execute.before",
     ]);
@@ -278,6 +284,7 @@ describe("plugin — 429-fallback gating", () => {
     });
     expect(Object.keys(hooks).sort()).toEqual([
       "config",
+      "event",
       "tool.execute.after",
       "tool.execute.before",
     ]);
