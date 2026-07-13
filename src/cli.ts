@@ -567,6 +567,7 @@ type ModeSource = "config" | "default" | "override";
 interface DetectedMode {
   mode: SelectionMode;
   source: "config" | "default";
+  recoveryEnabled: boolean;
   configPath?: string;
   pluginPath?: string;
 }
@@ -574,6 +575,7 @@ interface DetectedMode {
 /** Resolution result fed into the JSON snapshot. */
 interface ResolvedMode {
   mode: SelectionMode;
+  recoveryEnabled: boolean;
   modeSource: ModeSource;
   modeConfigPath?: string;
   modePluginPath?: string;
@@ -686,9 +688,14 @@ function detectModeFromConfig(): DetectedMode {
           modeValue === "advisory" ||
           modeValue === "off"
         ) {
+          const recovery = (options as { recovery?: unknown }).recovery;
+          const recoveryEnabled = recovery === null || typeof recovery !== "object"
+            ? true
+            : (recovery as { enabled?: unknown }).enabled !== false;
           return {
             mode: modeValue,
             source: "config",
+            recoveryEnabled,
             configPath: candidate,
             pluginPath: entryPath,
           };
@@ -697,15 +704,15 @@ function detectModeFromConfig(): DetectedMode {
       // Plugin entry matched but the mode is missing/invalid — short-circuit
       // to default. The user has the plugin wired up but the options bag
       // is malformed; probing further candidates would be misleading.
-      return { mode: "advisory", source: "default" };
+      return { mode: "advisory", source: "default", recoveryEnabled: true };
     }
 
     // File parsed cleanly but no model-forecast plugin entry was found.
     // Short-circuit to default — same rationale as above.
-    return { mode: "advisory", source: "default" };
+    return { mode: "advisory", source: "default", recoveryEnabled: true };
   }
 
-  return { mode: "advisory", source: "default" };
+  return { mode: "advisory", source: "default", recoveryEnabled: true };
 }
 
 export interface RunDoctorOptions {
@@ -719,6 +726,10 @@ export interface RunDoctorOptions {
   mode?: SelectionMode;
   /** Injectable clock for tests. Defaults to `() => new Date()`. */
   now?: () => Date;
+  /** Recovery kill-switch value, supplied by config detection or tests. */
+  recoveryEnabled?: boolean;
+  /** Runtime client capabilities when doctor is called from an embedded host. */
+  recoveryClient?: Partial<Record<"create" | "prompt" | "abort" | "promptAsync" | "children", boolean>>;
 }
 
 interface CacheSummary {
@@ -823,6 +834,22 @@ function buildRecommendations(
   return out;
 }
 
+function recoveryCapabilities(
+  enabled: boolean,
+  client: RunDoctorOptions["recoveryClient"],
+): Record<string, boolean> {
+  return {
+    eventHook: enabled,
+    create: client?.create === true,
+    prompt: client?.prompt === true,
+    abort: client?.abort === true,
+    promptAsync: client?.promptAsync === true,
+    children: client?.children === true,
+    watchdog: enabled,
+    parentRecovery: enabled,
+  };
+}
+
 /**
  * Parses `--mode <value>` (and `--mode=<value>`) out of the argv slice.
  * Returns:
@@ -899,6 +926,7 @@ function resolveMode(
       kind: "resolved",
       resolved: {
         mode: flag.mode,
+        recoveryEnabled: options.recoveryEnabled ?? true,
         modeSource: "override",
         overrideValue: flag.value,
       },
@@ -911,6 +939,7 @@ function resolveMode(
       kind: "resolved",
       resolved: {
         mode: options.mode,
+        recoveryEnabled: options.recoveryEnabled ?? true,
         modeSource: "override",
         overrideValue: `(programmatic: ${options.mode})`,
       },
@@ -924,6 +953,7 @@ function resolveMode(
       kind: "resolved",
       resolved: {
         mode: detected.mode,
+        recoveryEnabled: options.recoveryEnabled ?? detected.recoveryEnabled,
         modeSource: "config",
         modeConfigPath: detected.configPath,
         modePluginPath: detected.pluginPath,
@@ -934,7 +964,7 @@ function resolveMode(
   // 4. Default.
   return {
     kind: "resolved",
-    resolved: { mode: "advisory", modeSource: "default" },
+    resolved: { mode: "advisory", recoveryEnabled: options.recoveryEnabled ?? true, modeSource: "default" },
   };
 }
 
@@ -1070,6 +1100,10 @@ export async function runDoctor(
         openCodeModels: openCode,
       },
       recommendations,
+      recovery: {
+        enabled: resolved.resolved.recoveryEnabled,
+        capabilities: recoveryCapabilities(resolved.resolved.recoveryEnabled, options.recoveryClient),
+      },
     };
     if (resolved.resolved.modeConfigPath !== undefined) {
       snapshot.modeConfigPath = resolved.resolved.modeConfigPath;

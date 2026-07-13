@@ -360,11 +360,35 @@ export interface SelectionAuditEntry {
   kind?: "selection";
 }
 
+export type RecoveryAuditEvent =
+  | "failure_detected"
+  | "abort_requested"
+  | "fallback_started"
+  | "fallback_succeeded"
+  | "fallback_exhausted"
+  | "cancelled"
+  | "parent_recovery"
+  | "invalid_transition";
+
+/** Best-effort operational record for one supervised recovery event. */
+export interface RecoveryAuditEntry {
+  kind: "recovery";
+  timestamp: string;
+  callID: string;
+  event: RecoveryAuditEvent;
+  originalModel: string;
+  fallbackModel?: string | null;
+  terminal: boolean;
+  state?: import("./recovery-types.js").TaskRecoveryState;
+  result?: "success" | "exhausted" | "cancelled";
+  message?: string;
+}
+
 /**
  * Discriminated audit-entry union. Consumers narrow with
  * `entry.kind === "quarantine"`; the selection variant is the default.
  */
-export type AuditEntry = SelectionAuditEntry | import("./hooks.js").QuarantineAuditEntry;
+export type AuditEntry = SelectionAuditEntry | import("./hooks.js").QuarantineAuditEntry | RecoveryAuditEntry;
 
 /**
  * Configuration for the PR2 hook surface. In PR1, the plugin entry

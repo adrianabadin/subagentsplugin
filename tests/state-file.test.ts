@@ -30,6 +30,9 @@ function makeState(overrides: Partial<ForecastState> = {}): ForecastState {
     quarantined: ["opencode-go/deepseek-v4-pro"],
     cacheAge: null,
     lastUpdate: new Date().toISOString(),
+    activeRecoveryCount: 0,
+    activeRecoveries: [],
+    lastRecovery: null,
     ...overrides,
   };
 }
@@ -59,6 +62,30 @@ describe("state-file — writeStateFile / readStateFile", () => {
     expect(read?.selectedModel).toBe("anthropic/claude-opus-4-8");
     expect(read?.mode).toBe("auto");
     expect(read?.quarantined).toEqual(["opencode-go/deepseek-v4-pro"]);
+  });
+
+  it("round-trips active recovery state and the last terminal result", async () => {
+    await writeStateFile(statePath, makeState({
+      activeRecoveryCount: 1,
+      activeRecoveries: [{
+        callID: "call-1",
+        originalModel: "openai/gpt-5.5",
+        fallbackModel: "anthropic/claude-sonnet-4-5",
+        state: "fallback-running",
+      }],
+      lastRecovery: {
+        callID: "call-0",
+        originalModel: "openai/gpt-5.5",
+        fallbackModel: "anthropic/claude-sonnet-4-5",
+        state: "completed-fallback",
+        result: "success",
+      },
+    }));
+
+    const state = await readStateFile(statePath);
+    expect(state?.activeRecoveryCount).toBe(1);
+    expect(state?.activeRecoveries[0]?.fallbackModel).toBe("anthropic/claude-sonnet-4-5");
+    expect(state?.lastRecovery?.result).toBe("success");
   });
 
   it("readStateFile returns null when the file is missing", async () => {

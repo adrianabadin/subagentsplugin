@@ -142,6 +142,55 @@ describe("runDoctor() — JSON snapshot", () => {
     ).toBe(true);
   });
 
+  it("reports enabled recovery capabilities for a complete client", async () => {
+    const result = await runDoctor(
+      [],
+      {
+        cachePath,
+        gentleAiPath,
+        openCodePath,
+        mode: "auto",
+        recoveryEnabled: true,
+        recoveryClient: { create: true, prompt: true, abort: true, promptAsync: true, children: true },
+      },
+      { stdout, stderr },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(stdoutWrites.join(""));
+    expect(parsed.recovery).toEqual({
+      enabled: true,
+      capabilities: {
+        eventHook: true,
+        create: true,
+        prompt: true,
+        abort: true,
+        promptAsync: true,
+        children: true,
+        watchdog: true,
+        parentRecovery: true,
+      },
+    });
+  });
+
+  it("reports disabled recovery and unavailable methods for a partial client", async () => {
+    await runDoctor(
+      [],
+      { cachePath, gentleAiPath, openCodePath, recoveryEnabled: false, recoveryClient: { create: true } },
+      { stdout, stderr },
+    );
+
+    const parsed = JSON.parse(stdoutWrites.join(""));
+    expect(parsed.recovery.enabled).toBe(false);
+    expect(parsed.recovery.capabilities).toMatchObject({
+      eventHook: false,
+      create: true,
+      prompt: false,
+      watchdog: false,
+      parentRecovery: false,
+    });
+  });
+
   it("reads a populated model-data cache and reports provider/model counts", async () => {
     const data: ModelDataCache = {
       version: 1,

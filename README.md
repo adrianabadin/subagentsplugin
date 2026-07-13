@@ -77,6 +77,14 @@ OpenCode scans the project's `node_modules` and loads the plugin from there.
 | `generatedProfiles.enabled` | boolean | `true` | Master switch for generated-profile routing. |
 | `quarantine.enabled` | boolean | `true` (when `mode === "auto"`) | Enable the 429 fallback quarantine. Set `false` to skip the after hook entirely. |
 | `quarantine.ttlMs` | number | `3600000` (60 min) | Time-to-live for a quarantined model. |
+| `recovery.enabled` | boolean | `true` (when `mode === "auto"`) | Enable supervised recovery, watchdogs, and parent recovery without disabling model selection. |
+| `recovery.timeouts.INACTIVITY_TIMEOUT_MS` | number | `180000` | Override the inactivity watchdog for reasoning models that do not emit OpenCode activity heartbeats. |
+
+Reasoning models may spend several minutes before emitting visible output. The
+recovery watchdog treats every child-session event, including repeated busy
+status events, as activity. If a provider emits no heartbeats during reasoning,
+increase `recovery.timeouts.INACTIVITY_TIMEOUT_MS` instead of disabling
+recovery entirely.
 
 ## CLI
 

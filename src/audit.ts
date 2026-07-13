@@ -1,7 +1,7 @@
 import { appendFile, mkdir } from "fs/promises";
 import { dirname } from "path";
 
-import type { AuditEntry } from "./types.js";
+import type { AuditEntry, RecoveryAuditEntry } from "./types.js";
 
 export interface AuditOptions {
   auditPath?: string;
@@ -26,4 +26,20 @@ export async function writeAuditEntry(
   } catch {
     // Audit must never break the task call.
   }
+}
+
+/** Suppresses duplicate terminal records while keeping all observations. */
+export function createRecoveryAuditRecorder(options: AuditOptions = {}): {
+  record: (entry: RecoveryAuditEntry) => Promise<void>;
+} {
+  const terminalCallIDs = new Set<string>();
+  return {
+    async record(entry): Promise<void> {
+      if (entry.terminal) {
+        if (terminalCallIDs.has(entry.callID)) return;
+        terminalCallIDs.add(entry.callID);
+      }
+      await writeAuditEntry(entry, options);
+    },
+  };
 }

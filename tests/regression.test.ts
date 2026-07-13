@@ -151,6 +151,9 @@ describe("regression — forecast state file atomic round-trip", () => {
       quarantined: ["opencode-go/deepseek-v4-pro"],
       cacheAge: null,
       lastUpdate: "2026-07-08T12:00:00.000Z",
+      activeRecoveryCount: 0,
+      activeRecoveries: [],
+      lastRecovery: null,
     };
     await writeStateFile(statePath, state);
     const round = await readStateFile(statePath);

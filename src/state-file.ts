@@ -31,6 +31,18 @@ export interface ForecastState {
   quarantined: string[];
   cacheAge: string | null;
   lastUpdate: string;
+  activeRecoveryCount: number;
+  activeRecoveries: RecoveryStateEntry[];
+  lastRecovery: RecoveryStateEntry | null;
+}
+
+export interface RecoveryStateEntry {
+  callID: string;
+  originalModel: string;
+  fallbackModel: string | null;
+  state: string;
+  result?: "success" | "exhausted" | "cancelled";
+  failure?: string;
 }
 
 export const STATE_FILENAME = "state.json";
@@ -73,7 +85,30 @@ function validateState(value: unknown): { ok: true; state: ForecastState } | { o
   }
   if (!stringOrNull(v.cacheAge)) return { ok: false, reason: "cacheAge invalid" };
   if (typeof v.lastUpdate !== "string") return { ok: false, reason: "lastUpdate invalid" };
+  if (typeof v.activeRecoveryCount !== "number" || !Number.isFinite(v.activeRecoveryCount) || v.activeRecoveryCount < 0) {
+    return { ok: false, reason: "activeRecoveryCount invalid" };
+  }
+  if (!Array.isArray(v.activeRecoveries) || v.activeRecoveries.some((entry) => !isRecoveryStateEntry(entry))) {
+    return { ok: false, reason: "activeRecoveries invalid" };
+  }
+  if (v.activeRecoveryCount !== v.activeRecoveries.length) {
+    return { ok: false, reason: "activeRecoveryCount does not match activeRecoveries" };
+  }
+  if (v.lastRecovery !== null && !isRecoveryStateEntry(v.lastRecovery)) {
+    return { ok: false, reason: "lastRecovery invalid" };
+  }
   return { ok: true, state: value as ForecastState };
+}
+
+function isRecoveryStateEntry(value: unknown): value is RecoveryStateEntry {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry.callID === "string" &&
+    typeof entry.originalModel === "string" &&
+    (entry.fallbackModel === null || typeof entry.fallbackModel === "string") &&
+    typeof entry.state === "string" &&
+    (entry.result === undefined || entry.result === "success" || entry.result === "exhausted" || entry.result === "cancelled") &&
+    (entry.failure === undefined || typeof entry.failure === "string");
 }
 
 /**
@@ -139,6 +174,15 @@ export async function readStateFile(statePath: string): Promise<ForecastState | 
     parsed = JSON.parse(raw);
   } catch {
     return null;
+  }
+  // State files written before recovery observability are upgraded in memory.
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const value = parsed as Record<string, unknown>;
+    if (value.activeRecoveryCount === undefined && value.activeRecoveries === undefined && value.lastRecovery === undefined) {
+      value.activeRecoveryCount = 0;
+      value.activeRecoveries = [];
+      value.lastRecovery = null;
+    }
   }
   const result = validateState(parsed);
   return result.ok ? result.state : null;
