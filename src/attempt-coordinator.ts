@@ -225,9 +225,7 @@ const ACTIVE_TASK_STATES: ReadonlySet<TaskRecoveryState> = new Set<TaskRecoveryS
 /**
  * Central state machine for supervised subagent recovery.
  *
- * PR-04a: self-contained. PR-04b will replace the `Map<callID, TrackedCall>`
- * in `plugin.ts` with this coordinator, and replace the `fallbackSessionIDs`
- * field returned from `createAfterHook` with `coordinator.isInternalSession(...)`.
+ * Central state machine for supervised recovery attempts.
  */
 export class AttemptCoordinator {
   // ---- Indices (design §PR-04 items 2.1..2.8) ----
@@ -1000,10 +998,7 @@ function noopLogger(): Logger {
   // the full Logger constructor (which needs project context) into a
   // self-contained PR-04a unit test path.
   return {
-    trace: () => {},
-    info: () => {},
     warn: () => {},
-    error: () => {},
   } as unknown as Logger;
 }
 

@@ -776,12 +776,7 @@ export default async function modelForecastPlugin(
   const quarantine = new QuarantineStore({ ttlMs: options?.quarantine?.ttlMs, logger });
 
   // supervised-model-fallback-recovery (SDD change) — PR-04b.
-  // Coordinator (built in PR-04a) replaces the legacy
-  // `Map<string, TrackedCall>` AND the `fallbackSessionIDs` re-entrancy
-  // guard. One coordinator per plugin instance so multiple instances
-  // stay isolated. Production wiring always passes the coordinator to
-  // both hooks AND the fallback engine — `plugin.ts` no longer reads
-  // `innerAfterHook?.fallbackSessionIDs`.
+  // One coordinator per plugin instance keeps recovery state isolated.
   const recoveryObserver = createRecoveryObserver(options);
   let coordinatorForAudit: AttemptCoordinator | undefined;
   const recoveryLogger = {
@@ -883,9 +878,7 @@ export default async function modelForecastPlugin(
   // PR-04b: the `coordinator` is the canonical registry. Both the
   // before and after hooks read the re-entrancy guard from
   // `coordinator.isInternalSession(sessionID)` and the per-callID
-  // task state from `coordinator.tasksByCallID` — the legacy
-  // `Map<string, TrackedCall>` and `fallbackSessionIDs` fields are no
-  // longer part of the production wiring. Gated by `enabled !== false`
+  // task state from `coordinator.tasksByCallID`. Gated by `enabled !== false`
   // AND the client actually exposing usable `session.create`/
   // `session.prompt` methods; the default is ON only when both hold
   // (rollback plan: `fallback: {enabled: false}` — or an absent/

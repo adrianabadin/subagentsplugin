@@ -444,9 +444,8 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       // (because the fallback session itself dispatches a task tool call)
       // must see this session id as already-fallback-owned.
       //
-      // PR-04b: when a coordinator is wired, the mark mirrors into
-      // `coordinator.internalSessionIDs` so `coordinator.isInternalSession`
-      // returns true throughout the prompt. The legacy
+      // The coordinator records ownership before the prompt so
+      // `isInternalSession` remains true throughout the prompt.
       markInternal(sessionId, params.taskCallID);
 
       const { providerID, modelID } = splitModelId(nextModel);

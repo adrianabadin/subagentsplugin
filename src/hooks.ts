@@ -155,15 +155,11 @@ export interface TaskHookDependencies {
   logger?: Logger;
   /**
    * supervised-model-fallback-recovery (SDD change) — PR-04b.
-   * Central state machine that replaces the legacy `tracking` map
-   * AND the `fallbackSessionIDs` re-entrancy guard with a single
-   * source of truth. When supplied:
+   * Central state machine for recovery state. When supplied:
    *   - On a switch decision, `registerTask(...)` populates
-   *     `coordinator.tasksByCallID` (the legacy `tracking.set(...)`
-   *     path is skipped).
+   *     `coordinator.tasksByCallID`.
    *   - The re-entrancy guard reads `coordinator.isInternalSession(...)`
-   *     (the legacy `fallbackSessionIDs.has(...)` path is skipped).
-   * Omitted for callers/tests that pre-date PR-04b.
+   * Omitted when recovery coordination is disabled.
    */
   coordinator?: AttemptCoordinator;
 }
@@ -184,11 +180,7 @@ export function toolID(tool: HookInput["tool"]): string {
  *     `coordinator.isInternalSession(sessionID)` — it covers both the
  *     active set AND the tombstone window (so a late event is still
  *     recognised as fallback-owned and short-circuited).
- *   - When no coordinator is supplied (back-compat callers/tests),
- *     fall back to the legacy `fallbackSessionIDs` Set (the engine's
- *     active-only registry — pre-PR-04b behaviour).
- *   - When neither is supplied, the hook has nothing to guard against
- *     and the call proceeds normally.
+ *   - When no coordinator is supplied, the call proceeds normally.
  *
  * Exported for direct unit-testability; not re-exported by `src/api.ts`.
  */
@@ -407,33 +399,13 @@ export function parseGeneratedAlias(alias: string): ParsedAlias | null {
 }
 
 /* -------------------------------------------------------------------------- *
- * 429-fallback — createAfterHook + tracking map.
+ * 429-fallback — createAfterHook.
  * Spec #1316 requirements 1, 4. Fires on `tool.execute.after` for the
  * `task` tool only. When the rewritten alias parses as a generated
  * profile (`__mf_…`) AND the output matches a rate-limit pattern, the
  * tracked model is quarantined and one audit entry + one stderr line
  * are emitted. Sink failures MUST NOT break the hook.
  * -------------------------------------------------------------------------- */
-
-/**
- * Tracking record written by `createTaskHook` on a switch decision.
- * Model is the canonical `provider/model-id` (the lossy alias CANNOT
- * recover it — see design #1317 R11).
- */
-export interface TrackedCall {
-  originalSubagentType: string;
-  targetAlias: string;
-  model: string;
-  /**
-   * model-fallback-error-classification (SDD change) — Slice 3, task 24.
-   * The original task prompt text, captured so the after hook's fallback
-   * engine can re-send it verbatim to an alternate model
-   * (`client.session.prompt({..., parts:[{type:"text", text: prompt}]})`).
-   * Optional/additive: absent on trackers written before this field
-   * existed, or when the caller's `output.args.prompt` was not a string.
-   */
-  prompt?: string;
-}
 
 /**
  * Minimal shape of a `GeneratedProfileCatalog` slice that the after hook
@@ -454,12 +426,10 @@ export interface AfterHookDeps {
   logger?: Logger;
   /**
    * supervised-model-fallback-recovery (SDD change) — PR-04b.
-   * When supplied, the after hook reads/deletes task records from
+   * When supplied, the after hook reads task records from
    * `coordinator.tasksByCallID` and consults
    * `coordinator.isInternalSession(...)` for the re-entrancy guard.
-   * Production wiring (`plugin.ts`) always supplies a coordinator;
-   * legacy callers/tests that pre-date PR-04b can keep using
-   * `tracking` alone.
+   * Production wiring (`plugin.ts`) always supplies a coordinator.
    */
   coordinator?: AttemptCoordinator;
   /** PR-08 continuation guard for an after hook that never arrives. */
@@ -547,9 +517,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
 
   // supervised-model-fallback-recovery (SDD change) — PR-04b.
   // Resolves a per-callID task record from the coordinator's canonical
-  // `tasksByCallID` index (PR-04a substrate), falling back to the
-  // legacy `tracking` Map when no coordinator is wired. Returns
-  // `null` when neither source has an entry for `callID`.
+  // `tasksByCallID` index. Returns `null` when no coordinator entry exists.
   const readTask = (callID: string): {
     originalSubagentType: string;
     targetAlias: string;
@@ -570,10 +538,8 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
   };
 
   // supervised-model-fallback-recovery (SDD change) — PR-04b.
-  // Delete-on-consume is legacy-only. Coordinator tasks must remain available
-  // until arbitration settles the original output versus the fallback result.
-  // `tracking` map. Both paths are silent no-ops if the entry was
-  // already consumed by a previous after-hook invocation.
+  // Coordinator tasks remain available until arbitration settles the
+  // original output versus the fallback result.
   // model-fallback-error-classification (SDD change) — Slice 3, task 24.
   // The engine is constructed ONCE per hook (not per call) so its
   // The engine is constructed once per hook; the coordinator owns recovery

@@ -950,4 +950,155 @@ describe("AttemptCoordinator — dispose", () => {
     expect(coordinator.internalSessionIDs.size).toBe(0);
     expect(coordinator.pluginAbortSessionIDs.size).toBe(0);
   });
+
+  it("rejects all mutations after disposal and makes repeated disposal harmless", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    coordinator.dispose();
+    coordinator.dispose();
+
+    expect(() => buildTask(coordinator)).toThrow(/after dispose/);
+    expect(() => coordinator.bindSession({ attemptID: "missing", sessionID: "child" })).toThrow(/after dispose/);
+  });
+});
+
+describe("AttemptCoordinator — rejected inputs and late operations", () => {
+  it("uses defaults while preserving the original attempt and rejects terminal session binding", () => {
+    const coordinator = new AttemptCoordinator();
+    const task = buildTask(coordinator);
+    const original = registerOriginalAttempt(coordinator, task.callID, "original");
+    const fallback = coordinator.registerFallbackAttempt({
+      id: "fallback",
+      taskCallID: task.callID,
+      kind: "fallback",
+      sequence: 2,
+      model: "minimax/M3",
+      provider: "minimax",
+      agent: "sdd-design",
+      parentSessionID: "parent-1",
+      watchdogGeneration: 1,
+    });
+    expect(task.originalAttemptID).toBe(original.id);
+    coordinator.bindSession({ attemptID: fallback.id, sessionID: "fallback-session" });
+    coordinator.reportOriginalResult({ callID: task.callID, output: "ok" });
+    expect(coordinator.bindTaskSession({ callID: task.callID, sessionID: "late-session" })).toBe(task);
+    expect(coordinator.callIDBySessionID.has("late-session")).toBe(false);
+  });
+
+  it("rejects empty task and attempt ids, unknown attempts, and duplicate attempts without changing indices", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    expect(() => buildTask(coordinator, { callID: "" })).toThrow(/empty callID/);
+    const task = buildTask(coordinator);
+    expect(() => coordinator.registerFallbackAttempt({
+      id: "",
+      taskCallID: task.callID,
+      kind: "original",
+      sequence: 1,
+      model: "openai/gpt-4.1-mini",
+      provider: "openai",
+      agent: "sdd-design",
+      parentSessionID: "parent-1",
+      watchdogGeneration: 1,
+    })).toThrow(/empty id/);
+    expect(() => coordinator.registerFallbackAttempt({
+      id: "unknown-task",
+      taskCallID: "missing",
+      kind: "original",
+      sequence: 1,
+      model: "openai/gpt-4.1-mini",
+      provider: "openai",
+      agent: "sdd-design",
+      parentSessionID: "parent-1",
+      watchdogGeneration: 1,
+    })).toThrow(/unknown task/);
+    registerOriginalAttempt(coordinator, task.callID, "attempt-1");
+    expect(() => registerOriginalAttempt(coordinator, task.callID, "attempt-1")).toThrow(/duplicate attempt/);
+    expect(() => coordinator.bindSession({ attemptID: "missing", sessionID: "child" })).toThrow(/unknown attempt/);
+  });
+
+  it("returns safe shells for unknown result paths and ignores terminal attempt observations", () => {
+    const logger = silentLogger();
+    const coordinator = new AttemptCoordinator({ logger });
+    expect(coordinator.noteActivity({ attemptID: "missing" }).state).toBe("cleaned");
+    expect(coordinator.recordFallbackResult({ callID: "missing", result: makeFallbackSuccess() }).state).toBe("cleaned");
+    expect(coordinator.reportOriginalResult({ callID: "missing", output: "ok" }).state).toBe("cleaned");
+
+    const task = buildTask(coordinator);
+    const attempt = registerOriginalAttempt(coordinator, task.callID);
+    coordinator.bindSession({ attemptID: attempt.id, sessionID: "child" });
+    coordinator.claimFailure({ callID: task.callID, attemptID: attempt.id, failure: makeFailure(), source: "tool-after" });
+    expect(coordinator.noteActivity({ attemptID: attempt.id })).toBe(attempt);
+    expect(coordinator.noteToolBefore({ attemptID: attempt.id, toolCallID: "tool" })).toBe(attempt);
+    expect(coordinator.noteToolAfter({ attemptID: attempt.id, toolCallID: "tool" })).toBe(attempt);
+    expect(() => coordinator.noteToolBefore({ attemptID: "missing", toolCallID: "tool" })).toThrow(/unknown attempt/);
+    expect(() => coordinator.noteToolAfter({ attemptID: "missing", toolCallID: "tool" })).toThrow(/unknown attempt/);
+  });
+
+  it("cancels one task, associates sessions, and only enqueues a parent recovery once", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    const task = buildTask(coordinator, { callID: "single" });
+    expect(coordinator.taskForSession("missing")).toBeUndefined();
+    expect(coordinator.bindTaskSession({ callID: "missing", sessionID: "child" })).toBeUndefined();
+    coordinator.bindTaskSession({ callID: task.callID, sessionID: "child" });
+    expect(coordinator.taskForSession("child")).toBe(task);
+    expect(coordinator.cancelTask({ callID: task.callID, reason: "parent_cancelled" })?.state).toBe("cancelled");
+    expect(coordinator.cancelTask({ callID: task.callID, reason: "parent_cancelled" })?.state).toBe("cancelled");
+
+    const recoverable = buildTask(coordinator, { callID: "recoverable" });
+    expect(coordinator.markParentRecoveryEnqueued(recoverable.callID)).toBe(true);
+    expect(coordinator.markParentRecoveryEnqueued(recoverable.callID)).toBe(false);
+    expect(coordinator.markParentRecoveryEnqueued("missing")).toBe(false);
+  });
+
+  it("cleans every secondary index and tolerates a logger that throws", () => {
+    const logger = { warn: vi.fn(() => { throw new Error("sink failed"); }) } as unknown as Logger;
+    const coordinator = new AttemptCoordinator({ logger, maxTombstones: 1 });
+    const task = buildTask(coordinator, { callID: "cleanup" });
+    const attempt = registerOriginalAttempt(coordinator, task.callID, "cleanup-attempt");
+    coordinator.bindSession({ attemptID: attempt.id, sessionID: "cleanup-child" });
+    coordinator.bindTaskSession({ callID: task.callID, sessionID: "task-child" });
+    coordinator.registerPluginAbort({ sessionID: "cleanup-child", callID: task.callID, attemptID: attempt.id, origin: "plugin-watchdog", reason: "timeout" });
+    coordinator.reportOriginalResult({ callID: task.callID, output: "ok" });
+    coordinator.finalize({ callID: task.callID });
+
+    expect(coordinator.attemptsByID.size).toBe(0);
+    expect(coordinator.attemptsBySessionID.size).toBe(0);
+    expect(coordinator.callIDBySessionID.size).toBe(0);
+    expect(coordinator.pendingOriginalByParentID.size).toBe(0);
+    expect(coordinator.pluginAbortSessionIDs.size).toBe(0);
+    expect(() => coordinator.claimFailure({ callID: "cleanup", attemptID: attempt.id, failure: makeFailure(), source: "tool-after" })).not.toThrow();
+  });
+
+  it("handles parent and fallback terminal edge cases without mutating completed tasks", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    const task = buildTask(coordinator, { callID: "terminal" });
+    coordinator.bindTaskSession({ callID: task.callID, sessionID: "child" });
+    coordinator.reportOriginalResult({ callID: task.callID, output: "ok" });
+    expect(coordinator.cancelParent({ parentSessionID: "parent-1", reason: "user_cancelled" })).toEqual([]);
+    expect(coordinator.markFallbackExhausted({ callID: task.callID })).toBe(task);
+    expect(coordinator.markFallbackExhausted({ callID: "missing" }).state).toBe("cleaned");
+    coordinator.finalize({ callID: task.callID });
+    coordinator.finalize({ callID: task.callID });
+    expect(coordinator.completedTombstones.has(task.callID)).toBe(true);
+  });
+
+  it("keeps an internal-session tombstone stable when it is unmarked twice", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    coordinator.markInternalSession("internal");
+    coordinator.unmarkInternalSession("internal");
+    coordinator.unmarkInternalSession("internal");
+    expect(coordinator.internalSessionTombstones.size).toBe(1);
+  });
+
+  it("does not overwrite an authoritative failure or revive a completed task", () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    const task = buildTask(coordinator);
+    const attempt = registerOriginalAttempt(coordinator, task.callID);
+    coordinator.bindSession({ attemptID: attempt.id, sessionID: "child" });
+    coordinator.claimFailure({ callID: task.callID, attemptID: attempt.id, failure: makeFailure(), source: "tool-after" });
+    coordinator.reportOriginalResult({ callID: task.callID, output: "late success" });
+    expect(task.state).toBe("failure-claimed");
+    coordinator.setFallbackPromise({ callID: task.callID, promise: Promise.resolve(makeFallbackSuccess()) });
+    coordinator.recordFallbackResult({ callID: task.callID, result: makeFallbackSuccess() });
+    expect(coordinator.cancelParent({ parentSessionID: task.parentSessionID, reason: "user_cancelled" })).toHaveLength(1);
+  });
 });

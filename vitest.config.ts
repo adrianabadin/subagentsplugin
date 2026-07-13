@@ -11,6 +11,20 @@ export default defineConfig({
       reporter: ["text", "html"],
       include: ["src/**/*.ts"],
       exclude: ["src/**/*.d.ts"],
+      thresholds: {
+        "src/attempt-coordinator.ts": {
+          statements: 95,
+          branches: 90,
+          functions: 95,
+          lines: 95,
+        },
+        "src/fallback.ts": {
+          statements: 95,
+          branches: 90,
+          functions: 95,
+          lines: 95,
+        },
+      },
     },
   },
 });

@@ -94,7 +94,6 @@ describe("createEventHook — 429 status creates fallbackPromise early (merge ga
     expect(task?.state).toBe("fallback-ready");
   });
 });
-
 // ---------------------------------------------------------------------------
 // session.error — structured, authoritative, prevails over text (item 7)
 // ---------------------------------------------------------------------------
