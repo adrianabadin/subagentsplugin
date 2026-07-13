@@ -248,6 +248,8 @@ export class AttemptCoordinator {
   readonly tasksByParentSessionID = new Map<string, string[]>();
   readonly pluginAbortSessionIDs = new Map<string, PluginAbortRecord>();
   readonly internalSessionIDs = new Set<string>();
+  /** Active fallback session → owning callID, needed to cancel only its recovery. */
+  readonly internalSessionCallIDs = new Map<string, string>();
   /** callID → completedAt wall-clock (used for deferred cleanup eviction). */
   readonly completedTombstones = new Map<string, number>();
   /** sessionID → tombstoned-at wall-clock (used by `isInternalSession` for late events). */
@@ -663,6 +665,16 @@ export class AttemptCoordinator {
     return cancelled;
   }
 
+  /** Cancel one task for a human/external abort without touching sibling work. */
+  cancelTask(input: { callID: string; reason: "user_cancelled" | "parent_cancelled"; now?: number }): TrackedTask | undefined {
+    this.assertAlive();
+    const task = this.tasksByCallID.get(input.callID);
+    if (task === undefined || !ACTIVE_TASK_STATES.has(task.state)) return task;
+    transitionTask(task, "cancelled", input.now ?? this.nowFn());
+    task.userCancelled = input.reason === "user_cancelled";
+    return task;
+  }
+
   // -------------------------------------------------------------------------
   // Cleanup / tombstones
   // -------------------------------------------------------------------------
@@ -789,9 +801,10 @@ export class AttemptCoordinator {
   }
 
   /** Register a session as created by the fallback engine (before `session.prompt`). */
-  markInternalSession(sessionID: string): void {
+  markInternalSession(sessionID: string, callID?: string): void {
     this.assertAlive();
     this.internalSessionIDs.add(sessionID);
+    if (callID !== undefined) this.internalSessionCallIDs.set(sessionID, callID);
   }
 
   /**
@@ -801,6 +814,7 @@ export class AttemptCoordinator {
   unmarkInternalSession(sessionID: string, now?: number): void {
     this.assertAlive();
     this.internalSessionIDs.delete(sessionID);
+    this.internalSessionCallIDs.delete(sessionID);
     if (!this.internalSessionTombstones.has(sessionID)) {
       this.internalSessionTombstones.set(sessionID, now ?? this.nowFn());
       const timer = setTimeout(() => {
@@ -858,6 +872,7 @@ export class AttemptCoordinator {
     this.tasksByParentSessionID.clear();
     this.pluginAbortSessionIDs.clear();
     this.internalSessionIDs.clear();
+    this.internalSessionCallIDs.clear();
     this.completedTombstones.clear();
     this.internalSessionTombstones.clear();
   }

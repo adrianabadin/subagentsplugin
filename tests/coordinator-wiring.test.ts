@@ -345,8 +345,8 @@ describe("createAfterHook — reads task from coordinator.tasksByCallID", () => 
 // 4. createAfterHook — delete-on-consume delegates to coordinator
 // ---------------------------------------------------------------------------
 
-describe("createAfterHook — delete-on-consume via coordinator.tasksByCallID", () => {
-  it("deletes the task from coordinator.tasksByCallID after a successful quarantine dispatch", async () => {
+describe("createAfterHook — coordinator task retention for arbitration", () => {
+  it("keeps the task available after quarantine dispatch so PR-07 can arbitrate late outcomes", async () => {
     const coordinator = new AttemptCoordinator({ logger: silentLogger() });
     seedTrackedTask(
       coordinator,
@@ -370,7 +370,7 @@ describe("createAfterHook — delete-on-consume via coordinator.tasksByCallID", 
     const output: { output?: unknown } = { output: "upstream returned HTTP 429" };
     await hook({ tool: { id: "task" }, sessionID: "parent", callID: "c1" }, output);
 
-    expect(coordinator.tasksByCallID.has("c1")).toBe(false);
+    expect(coordinator.tasksByCallID.has("c1")).toBe(true);
   });
 
   it("a second after-hook invocation with the same callID is a no-op (already consumed)", async () => {

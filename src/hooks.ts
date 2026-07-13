@@ -61,6 +61,7 @@ import {
   type FallbackCatalogSlice,
 } from "./fallback.js";
 import type { AttemptCoordinator } from "./attempt-coordinator.js";
+import { decideOriginalResult } from "./recovery-arbitration.js";
 import type { Logger } from "./logger.js";
 import type {
   AuditEntry,
@@ -630,13 +631,12 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
   };
 
   // supervised-model-fallback-recovery (SDD change) — PR-04b.
-  // Delete-on-consume. When the coordinator is wired, delegates to
-  // `tasksByCallID.delete(callID)`; otherwise delegates to the legacy
+  // Delete-on-consume is legacy-only. Coordinator tasks must remain available
+  // until arbitration settles the original output versus the fallback result.
   // `tracking` map. Both paths are silent no-ops if the entry was
   // already consumed by a previous after-hook invocation.
   const consumeTask = (callID: string): void => {
     if (coordinator !== undefined) {
-      coordinator.tasksByCallID.delete(callID);
       return;
     }
     tracking?.delete(callID);
@@ -690,13 +690,33 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
     if (callID.length === 0) return;
     const tracked = readTask(callID);
     if (tracked === null) return;
+    const text = typeof output.output === "string" ? output.output : "";
+    const coordinatedTask = coordinator?.tasksByCallID.get(callID);
+    if (coordinatedTask !== undefined) {
+      coordinatedTask.afterHookSeen = true;
+      if (coordinatedTask.userCancelled) return;
+      if (coordinatedTask.failureAuthoritative) {
+        const result = coordinatedTask.fallbackResult ?? await coordinatedTask.fallbackPromise;
+        if (result?.status === "success") {
+          output.output = result.output;
+          output.metadata = { ...(output.metadata !== null && typeof output.metadata === "object" ? output.metadata as Record<string, unknown> : {}), mfFallback: { attempts: result.attempts.length, model: result.model } };
+        } else if (result?.status === "exhausted") {
+          output.output = result.output;
+        }
+        return;
+      }
+      if (classifyError(text) === null) {
+        const decision = decideOriginalResult(coordinatedTask, text);
+        if (decision.action === "original") coordinator?.reportOriginalResult({ callID, output: text });
+        return;
+      }
+    }
     // Delete-on-consume: a single task call triggers a single quarantine
     // decision. Re-entry with the same callID is silent.
     consumeTask(callID);
 
     if (parseGeneratedAlias(tracked.targetAlias) === null) return;
 
-    const text = typeof output.output === "string" ? output.output : "";
     // model-fallback-error-classification (SDD change) — Slice 1, task 8.
     // Spec #1620 "Structured Error Classification": classify via the
     // canonical `classifyError` (model_not_configured > provider_error >
@@ -782,14 +802,27 @@ const ttlMs = resolveQuarantineTtlMs({
     // `output.output`/`output.metadata.mfFallback`; exhaustion writes the
     // explicit terminal error — NEVER a silent empty output.
     if (fallbackEngine === undefined || !fallbackEnabled) return;
-
-    const result = await fallbackEngine.run({
+    if (coordinator !== undefined) {
+      const claim = coordinator.claimFailure({
+        callID,
+        attemptID: coordinatedTask?.originalAttemptID ?? "",
+        failure: { kind: errorType === "manual" ? "unknown_terminal" : errorType, source: "tool-after", code: reason, message: text, retryable: errorType === "rate_limit", authoritative: true, detectedAt: Date.now() },
+        source: "tool-after",
+      });
+      if (!claim.claimed) return;
+    }
+    const fallbackRun = fallbackEngine.run({
       sessionID: input.sessionID ?? "",
+      ...(coordinator !== undefined ? { taskCallID: callID } : {}),
       originalSubagentType: tracked.originalSubagentType,
       prompt: tracked.prompt ?? "",
       failedModel: tracked.model,
       failureReason: reason,
     });
+    const result = coordinator !== undefined
+      ? await coordinator.setFallbackPromise({ callID, promise: fallbackRun })
+      : await fallbackRun;
+    if (coordinator !== undefined) coordinator.recordFallbackResult({ callID, result });
 
     const existingMetadata =
       output.metadata !== null && typeof output.metadata === "object"

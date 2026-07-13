@@ -338,11 +338,11 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   // coordinator is supplied, the engine's local Set is the only
   // bookkeeping — back-compat with callers/tests that pre-date
   // PR-04b.
-  function markInternal(sessionId: string): void {
+  function markInternal(sessionId: string, taskCallID: string | undefined): void {
     fallbackSessionIDs.add(sessionId);
     if (coordinator !== undefined) {
       try {
-        coordinator.markInternalSession(sessionId);
+        coordinator.markInternalSession(sessionId, taskCallID);
       } catch (err) {
         logger?.warn(
           "fallback",
@@ -414,6 +414,9 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
     const canDispatch = typeof sessionApi?.create === "function" && typeof sessionApi?.prompt === "function";
 
     while (attempts.length < maxAttempts) {
+      if (params.taskCallID !== undefined && coordinator?.tasksByCallID.get(params.taskCallID)?.userCancelled) {
+        return { status: "cancelled", reason: "user_cancelled", attempts };
+      }
       if (!canDispatch) break;
 
       const nextModel = findNextViableModel(
@@ -499,7 +502,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       // returns true throughout the prompt. The legacy
       // `fallbackSessionIDs.add(sessionId)` is preserved inside
       // `markInternal` for back-compat callers/tests.
-      markInternal(sessionId);
+      markInternal(sessionId, params.taskCallID);
 
       const { providerID, modelID } = splitModelId(nextModel);
 
@@ -548,6 +551,9 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         // Tombstone this session: prompt failed but session id still
         // exists. Move it from active to tombstone.
         unmarkInternal(sessionId);
+        if (params.taskCallID !== undefined && coordinator?.tasksByCallID.get(params.taskCallID)?.userCancelled) {
+          return { status: "cancelled", reason: "user_cancelled", attempts };
+        }
         continue;
       }
 

@@ -117,11 +117,11 @@ describe("createEventHook — session.error authoritative claims", () => {
     expect(coordinator.tasksByCallID.get("c-1")?.failure?.kind).toBe("model_not_configured");
   });
 
-  it("ignores a MessageAbortedError (abort is not a model failure — no watchdog/abort in PR-05)", async () => {
+  it("treats an unregistered MessageAbortedError as human cancellation (PR-07)", async () => {
     const { coordinator, hook, startSpy } = setup();
     await hook(sessionErrorEvent("child-1", { name: "MessageAbortedError", data: { message: "aborted" } }));
 
-    expect(coordinator.tasksByCallID.get("c-1")?.state).toBe("running-original");
+    expect(coordinator.tasksByCallID.get("c-1")?.state).toBe("cancelled");
     expect(coordinator.tasksByCallID.get("c-1")?.failure).toBeUndefined();
     expect(startSpy).not.toHaveBeenCalled();
   });

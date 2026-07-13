@@ -31,6 +31,7 @@ import type { AttemptWatchdog } from "./attempt-watchdog.js";
 import type { FallbackResult } from "./fallback.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
+import { safeAbortSession } from "./session-abort.js";
 import type { AttemptFailure, FailureSource, TrackedTask } from "./recovery-types.js";
 import {
   classifyErrorText,
@@ -230,12 +231,46 @@ export function createEventHook(deps: EventHookDeps): EventHook {
 
   function handleSessionError(event: Extract<NormalizedEvent, { kind: "session.error" }>): void {
     if (event.error === undefined || event.sessionID === undefined) return;
+    if (event.error.name === "MessageAbortedError") {
+      void handleExternalAbort(event.sessionID);
+      return;
+    }
     // Design item 7: the structured error prevails over any text.
     const failure = classifyStructuredError(event.error);
     if (failure === null) return;
     const task = coordinator.taskForSession(event.sessionID);
     if (task === undefined) return;
     claimAndDispatch(task, failure, "session-error");
+  }
+
+  async function handleExternalAbort(sessionID: string): Promise<void> {
+    // Plugin-owned aborts were registered before the SDK call (INV-007).
+    if (coordinator.pluginAbortSessionIDs.has(sessionID)) return;
+    const direct = coordinator.taskForSession(sessionID);
+    const callIDs = direct !== undefined
+      ? [direct.callID]
+      : coordinator.tasksByParentSessionID.get(sessionID) ??
+        (coordinator.internalSessionCallIDs.has(sessionID) ? [coordinator.internalSessionCallIDs.get(sessionID)!] : []);
+    if (callIDs.length === 0) return;
+    if (direct === undefined && coordinator.tasksByParentSessionID.has(sessionID)) {
+      coordinator.cancelParent({ parentSessionID: sessionID, reason: "user_cancelled" });
+    } else {
+      for (const callID of callIDs) coordinator.cancelTask({ callID, reason: "user_cancelled" });
+    }
+    for (const [fallbackSessionID, callID] of coordinator.internalSessionCallIDs) {
+      if (!callIDs.includes(callID)) continue;
+      const task = coordinator.tasksByCallID.get(callID);
+      void safeAbortSession({
+        client: client?.session,
+        coordinator,
+        sessionID: fallbackSessionID,
+        callID,
+        attemptID: task?.originalAttemptID || fallbackSessionID,
+        origin: "plugin-cleanup",
+        reason: "user_cancelled",
+        logger,
+      });
+    }
   }
 
   function handleMessageUpdated(event: Extract<NormalizedEvent, { kind: "message.updated" }>): void {
@@ -303,8 +338,13 @@ export function createEventHook(deps: EventHookDeps): EventHook {
       const event = normalizeEvent(raw);
       if (event === null) return;
 
-      // Re-entrancy: never act on events for fallback-owned sessions.
       const sessionID = eventSessionID(event);
+      // An abort is the one internal-session event that must be arbitrated.
+      if (sessionID !== undefined && event.kind === "session.error" && event.error?.name === "MessageAbortedError") {
+        await handleExternalAbort(sessionID);
+        return;
+      }
+      // Re-entrancy: never act on other events for fallback-owned sessions.
       if (sessionID !== undefined && coordinator.isInternalSession(sessionID)) return;
       if (sessionID !== undefined && coordinator.taskForSession(sessionID) !== undefined && isActivityEvent(event)) {
         if (event.kind === "permission.updated") watchdog?.permissionPending(sessionID, true);
