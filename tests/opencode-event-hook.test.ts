@@ -271,6 +271,26 @@ describe("createEventHook — ignore, re-entrancy, robustness", () => {
   });
 });
 
+describe("createEventHook — PR-06 watchdog wiring", () => {
+  it("arms on bind, records child activity, and pauses/resumes permission inactivity", async () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger(), now: () => NOW });
+    coordinator.registerTask({ callID: "watch-c", parentSessionID: "parent", originalSubagentType: "sdd-design", generatedAlias: "alias", originalModel: "openai/gpt-5.5", prompt: "p" });
+    const watchdog = { watch: vi.fn(), bind: vi.fn(), stop: vi.fn(), activity: vi.fn(), permissionPending: vi.fn() };
+    const hook = createEventHook({ coordinator, watchdog });
+
+    await hook({ event: { type: "session.created", properties: { info: { id: "child-watch", parentID: "parent", title: "watch-c" } } } });
+    await hook({ event: { type: "session.status", properties: { sessionID: "child-watch", status: { type: "busy" } } } });
+    await hook({ event: { type: "permission.updated", properties: { sessionID: "child-watch" } } });
+    await hook({ event: { type: "permission.replied", properties: { sessionID: "child-watch" } } });
+
+    expect(watchdog.watch).toHaveBeenCalledWith("child-watch");
+    expect(watchdog.bind).toHaveBeenCalledWith("child-watch");
+    expect(watchdog.activity).toHaveBeenCalledTimes(3);
+    expect(watchdog.permissionPending).toHaveBeenNthCalledWith(1, "child-watch", true);
+    expect(watchdog.permissionPending).toHaveBeenNthCalledWith(2, "child-watch", false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // plugin.ts wiring — the event hook is registered and dispatches early
 // ---------------------------------------------------------------------------

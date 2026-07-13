@@ -158,6 +158,8 @@ export interface TaskHookDependencies {
    * coordinator keep working unchanged.
    */
   tracking?: Map<string, TrackedCall>;
+  /** PR-06 hook point invoked after a supervised task is registered. */
+  onTaskRegistered?: (callID: string) => void;
   /** Test helper: clock for deterministic ISO timestamps. */
   now?: () => Date;
   /** Optional logger instance for structured per-call tracing. */
@@ -1007,6 +1009,7 @@ export function createTaskHook(
               originalModel: finalDecision.model,
               prompt: typeof output.args.prompt === "string" ? output.args.prompt : "",
             });
+            deps.onTaskRegistered?.(callID);
           } catch (err) {
             // registerTask throws on duplicate callID or capacity
             // overflow. The before-hook's `handledCallIds` set already

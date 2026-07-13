@@ -43,6 +43,7 @@ import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
 import type { AttemptCoordinator } from "./attempt-coordinator.js";
+import { safeAbortSession } from "./session-abort.js";
 import {
   classifySdkResult,
   type AttemptOutcome,
@@ -51,6 +52,7 @@ import { withDeadline, DeadlineError } from "./async-deadline.js";
 import {
   DEFAULT_RATE_LIMIT_TTL_MS,
   MAX_TOTAL_ATTEMPTS,
+  ATTEMPT_HARD_TIMEOUT_MS,
   SESSION_CREATE_TIMEOUT_MS,
 } from "./recovery-policy.js";
 import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
@@ -136,6 +138,8 @@ export interface FallbackEngineDeps {
   maxAttempts?: number;
   /** Override the deadline applied to `session.create` (default: `SESSION_CREATE_TIMEOUT_MS`). */
   sessionCreateTimeoutMs?: number;
+  /** Bound a fallback prompt so it can never be the sole progress signal. */
+  sessionPromptTimeoutMs?: number;
   now?: () => Date;
   logger?: Logger;
   /**
@@ -155,6 +159,8 @@ export interface FallbackEngineDeps {
 export interface FallbackRunParams {
   /** The parent (original) session id — used as `parentID` for created child sessions. */
   sessionID: string;
+  /** Owning supervised task when this engine is invoked by recovery wiring. */
+  taskCallID?: string;
   /** The base subagent_type / phase, used for `agent` on the prompt and in the terminal error message. */
   originalSubagentType: string;
   /** The original task prompt text, re-sent verbatim to each fallback candidate. */
@@ -317,6 +323,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const { quarantine, catalog, ladder, logger, coordinator } = deps;
   const maxAttempts = deps.maxAttempts ?? MAX_TOTAL_ATTEMPTS;
   const sessionCreateTimeoutMs = deps.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
+  const sessionPromptTimeoutMs = deps.sessionPromptTimeoutMs ?? ATTEMPT_HARD_TIMEOUT_MS;
   const nowFn = deps.now ?? ((): Date => new Date());
   const fallbackSessionIDs = new Set<string>();
   const tombstoneSessionIDs = new Set<string>();
@@ -498,19 +505,37 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
 
       let promptResult: unknown;
       try {
-        promptResult = await Promise.resolve(
-          sessionApi!.prompt!({
+        promptResult = await withDeadline(
+          "session.prompt",
+          sessionPromptTimeoutMs,
+          () => Promise.resolve(sessionApi!.prompt!({
             path: { id: sessionId },
             body: {
               model: { providerID, modelID },
               agent: params.originalSubagentType,
               parts: [{ type: "text", text: params.prompt }],
             },
-          }),
+          })),
         );
       } catch (err) {
         const finishedAt = nowMs(nowFn);
-        const reason = err instanceof Error ? err.message : "session_prompt_failed";
+        const timedOut = err instanceof DeadlineError;
+        const reason = timedOut ? "hard_timeout" : err instanceof Error ? err.message : "session_prompt_failed";
+        if (timedOut && coordinator !== undefined && params.taskCallID !== undefined) {
+          const task = coordinator.tasksByCallID.get(params.taskCallID);
+          void safeAbortSession({
+            client: sessionApi,
+            coordinator,
+            sessionID: sessionId,
+            callID: params.taskCallID,
+            attemptID: task?.originalAttemptID || sessionId,
+            origin: "plugin-watchdog",
+            reason: "hard_timeout",
+            logger,
+          });
+        } else if (timedOut && typeof sessionApi!.abort === "function") {
+          void Promise.resolve(sessionApi!.abort!({ path: { id: sessionId } })).catch(() => {});
+        }
         logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
         attempts.push({
           sequence: (attempts.length + 1) as 1 | 2 | 3,

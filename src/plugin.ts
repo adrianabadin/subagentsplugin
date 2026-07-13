@@ -58,8 +58,11 @@ import { loadQuarantineFile } from "./cli-quarantine.js";
 import { loadEffectiveBenchmarks } from "./repo-data.js";
 import { DEFAULT_LADDER } from "./policy.js";
 import { AttemptCoordinator } from "./attempt-coordinator.js";
+import { AttemptWatchdog, type AttemptWatchdogTimeouts } from "./attempt-watchdog.js";
+import { safeAbortSession } from "./session-abort.js";
 import type { HooksConfig, ModelDataCache, SelectionMode } from "./types.js";
 import type { ResolveCandidates } from "./hooks.js";
+import type { AttemptFailure } from "./recovery-types.js";
 
 /**
  * Module-level dedupe state. Tracks the in-flight refresh keyed by
@@ -644,6 +647,26 @@ export default async function modelForecastPlugin(
   // both hooks AND the fallback engine — `plugin.ts` no longer reads
   // `innerAfterHook?.fallbackSessionIDs`.
   const coordinator = new AttemptCoordinator({ logger });
+  let watchdog: AttemptWatchdog | undefined;
+  const recoveryEnabled = options?.recovery?.enabled !== false;
+
+  function recoveryTimeouts(): AttemptWatchdogTimeouts {
+    const configured = options?.recovery?.timeouts;
+    type RecoveryTimeoutKey = "FIRST_ACTIVITY_TIMEOUT_MS" | "INACTIVITY_TIMEOUT_MS" | "TOOL_EXECUTION_TIMEOUT_MS" | "ATTEMPT_HARD_TIMEOUT_MS";
+    const read = (key: RecoveryTimeoutKey): number | undefined => {
+      const value = configured?.[key];
+      if (value === undefined) return undefined;
+      if (Number.isFinite(value) && value > 0) return value;
+      logger.warn("recovery", `invalid ${key} override; using recovery-policy default`);
+      return undefined;
+    };
+    return {
+      firstActivityMs: read("FIRST_ACTIVITY_TIMEOUT_MS"),
+      inactivityMs: read("INACTIVITY_TIMEOUT_MS"),
+      toolMs: read("TOOL_EXECUTION_TIMEOUT_MS"),
+      hardMs: read("ATTEMPT_HARD_TIMEOUT_MS"),
+    };
+  }
 
   // Cross-bundle publishing: tsup builds the plugin (`dist/index.js`)
   // and the TUI (`dist/tui.js`) as SEPARATE bundles, so the TUI cannot
@@ -860,7 +883,8 @@ export default async function modelForecastPlugin(
       createTaskHook(hookConfig, {
         resolveCandidates: options?.resolveCandidates ?? generatedProfileResolver,
         logger,
-        ...(quarantineEnabled ? { coordinator } : {}),
+        ...(quarantineEnabled && recoveryEnabled ? { coordinator } : {}),
+        onTaskRegistered: (callID) => watchdog?.watch(callID, { waitingForBind: true }),
       }),
       logger,
     ),
@@ -895,7 +919,6 @@ export default async function modelForecastPlugin(
   // items 10 + 11). It uses a dedicated bounded fallback engine that
   // shares the coordinator + quarantine + catalog so internal-session
   // bookkeeping stays consistent with the after hook.
-  const recoveryEnabled = options?.recovery?.enabled !== false;
   if (recoveryEnabled) {
     const eventFallbackEngine =
       fallbackEnabled && client !== undefined
@@ -911,15 +934,70 @@ export default async function modelForecastPlugin(
           })
         : undefined;
 
+    const activeWatchdog = watchdog = new AttemptWatchdog({
+      timeouts: recoveryTimeouts(),
+      onTimeout: async ({ attemptID, kind }) => {
+        const task = coordinator.taskForSession(attemptID);
+        if (task === undefined) return;
+        const timeoutKind: AttemptFailure["kind"] = kind === "first_activity" ? "first_activity_timeout"
+          : kind === "inactivity" ? "inactivity_timeout"
+            : kind === "tool" ? "tool_execution_timeout"
+              : kind === "hard" ? "hard_timeout" : "session_create_timeout";
+        const failure = {
+          kind: timeoutKind,
+          source: "watchdog" as const,
+          code: timeoutKind,
+          message: `watchdog timeout: ${kind}`,
+          retryable: true,
+          authoritative: true,
+          detectedAt: Date.now(),
+        };
+        const claim = coordinator.claimFailure({
+          callID: task.callID,
+          attemptID: task.originalAttemptID,
+          failure,
+          source: "watchdog",
+        });
+        // Recovery and abort intentionally start independently: a hung
+        // abort must never become the sole condition for fallback progress.
+        const fallbackPromise = claim.claimed && eventFallbackEngine !== undefined
+          ? eventFallbackEngine.run({
+              sessionID: task.parentSessionID,
+              taskCallID: task.callID,
+              originalSubagentType: task.originalSubagentType,
+              prompt: task.prompt,
+              failedModel: task.originalModel,
+              failureReason: timeoutKind,
+            })
+          : undefined;
+        if (fallbackPromise !== undefined) {
+          coordinator.setFallbackPromise({ callID: task.callID, promise: fallbackPromise });
+          void fallbackPromise.then((result) => coordinator.recordFallbackResult({ callID: task.callID, result }), () => {});
+        }
+        await safeAbortSession({
+          client: client?.session,
+          coordinator,
+          sessionID: attemptID,
+          callID: task.callID,
+          attemptID: task.originalAttemptID || attemptID,
+          origin: "plugin-watchdog",
+          reason: timeoutKind,
+          logger,
+        });
+      },
+    });
+
     const eventHook = createEventHook({
       coordinator,
       ...(client !== undefined ? { client: { session: client.session } } : {}),
       logger,
+      watchdog: activeWatchdog,
       ...(eventFallbackEngine !== undefined
         ? {
             startFallback: (task, failure) =>
               eventFallbackEngine.run({
                 sessionID: task.parentSessionID,
+                taskCallID: task.callID,
                 originalSubagentType: task.originalSubagentType,
                 prompt: task.prompt,
                 failedModel: task.originalModel,

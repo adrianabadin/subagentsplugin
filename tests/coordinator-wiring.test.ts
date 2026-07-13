@@ -115,6 +115,14 @@ function seedTrackedTask(
 // ---------------------------------------------------------------------------
 
 describe("createTaskHook — coordinator.registerTask on accepted switch", () => {
+  it("notifies supervision after registering an accepted task", async () => {
+    const coordinator = new AttemptCoordinator({ logger: silentLogger() });
+    const onTaskRegistered = vi.fn();
+    const hook = createTaskHook(cfg, { coordinator, onTaskRegistered, select: () => decision() });
+    await hook({ tool: { id: "task" }, sessionID: "s1", callID: "watch-call" }, { args: { subagent_type: "sdd-design", prompt: "work" } });
+    expect(onTaskRegistered).toHaveBeenCalledWith("watch-call");
+  });
+
   it("writes a TrackedTask entry to coordinator.tasksByCallID on a switch decision", async () => {
     const coordinator = new AttemptCoordinator({ logger: silentLogger() });
     const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-5.5");

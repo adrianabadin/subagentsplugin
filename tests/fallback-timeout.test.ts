@@ -20,6 +20,7 @@ import { createFallbackEngine, type FallbackCatalogSlice, type FallbackClient } 
 import { QuarantineStore } from "../src/quarantine.js";
 import { classifyError } from "../src/error-classification.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
+import { AttemptCoordinator } from "../src/attempt-coordinator.js";
 
 function makeCatalog(
   byBase: Record<string, Array<{ modelId: string }>>,
@@ -379,5 +380,46 @@ describe("createFallbackEngine() — tombstone after completion", () => {
     expect(engine.fallbackSessionIDs.size).toBe(0);
     expect(engine.tombstoneSessionIDs.has("child-1")).toBe(true);
     expect(engine.tombstoneSessionIDs.has("child-2")).toBe(true);
+  });
+});
+
+describe("createFallbackEngine() — supervised fallback prompt", () => {
+  it("aborts a hung fallback prompt instead of waiting indefinitely", async () => {
+    vi.useFakeTimers();
+    try {
+      const abort = vi.fn(async () => {});
+      const engine = createFallbackEngine({
+        client: { session: { create: vi.fn(async () => ({ id: "hung-child" })), prompt: vi.fn(() => new Promise(() => {})), abort } },
+        quarantine: new QuarantineStore({ ttlMs: 1_000 }),
+        catalog: makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] }),
+        ladder: DEFAULT_LADDER,
+        classify: classifyError,
+        maxAttempts: 2,
+        sessionPromptTimeoutMs: 10,
+      });
+      const result = engine.run({ sessionID: "parent", originalSubagentType: "sdd-design", prompt: "work", failedModel: "openai/gpt-4.1-mini", failureReason: "rate_limit" });
+      await vi.advanceTimersByTimeAsync(10);
+      expect((await result).status).toBe("exhausted");
+      expect(abort).toHaveBeenCalledWith({ path: { id: "hung-child" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records a watchdog abort before terminating a supervised fallback prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const coordinator = new AttemptCoordinator();
+      coordinator.registerTask({ callID: "fallback-call", parentSessionID: "parent", originalSubagentType: "sdd-design", generatedAlias: "alias", originalModel: "openai/gpt-4.1-mini", prompt: "work" });
+      const engine = createFallbackEngine({
+        client: { session: { create: vi.fn(async () => ({ id: "supervised-child" })), prompt: vi.fn(() => new Promise(() => {})), abort: vi.fn(async () => {}) } },
+        quarantine: new QuarantineStore({ ttlMs: 1_000 }), catalog: makeCatalog({ "sdd-design": [{ modelId: "openai/gpt-4.1-mini" }, { modelId: "minimax/M3" }] }),
+        ladder: DEFAULT_LADDER, classify: classifyError, maxAttempts: 2, sessionPromptTimeoutMs: 10, coordinator,
+      });
+      const result = engine.run({ sessionID: "parent", taskCallID: "fallback-call", originalSubagentType: "sdd-design", prompt: "work", failedModel: "openai/gpt-4.1-mini", failureReason: "rate_limit" });
+      await vi.advanceTimersByTimeAsync(10);
+      await result;
+      expect(coordinator.pluginAbortSessionIDs.get("supervised-child")?.origin).toBe("plugin-watchdog");
+    } finally { vi.useRealTimers(); }
   });
 });

@@ -27,6 +27,7 @@
  */
 
 import type { AttemptCoordinator } from "./attempt-coordinator.js";
+import type { AttemptWatchdog } from "./attempt-watchdog.js";
 import type { FallbackResult } from "./fallback.js";
 import type { Logger } from "./logger.js";
 import type { OpenCodeSessionClient } from "./opencode-client.js";
@@ -35,6 +36,7 @@ import {
   classifyErrorText,
   classifyStructuredError,
   eventSessionID,
+  isActivityEvent,
   normalizeEvent,
   resolveAssociation,
   resolveKnownResetMs,
@@ -58,6 +60,8 @@ export interface EventHookDeps {
   logger?: Logger;
   /** Injected clock (epoch ms). Defaults to `Date.now`. */
   now?: () => number;
+  /** PR-06 activity watchdog; keyed by child session id in the event path. */
+  watchdog?: Pick<AttemptWatchdog, "watch" | "bind" | "stop" | "activity" | "permissionPending">;
   /**
    * Dispatches the bounded fallback engine for a task whose failure was
    * claimed from an event, BEFORE `tool.execute.after` fires (merge
@@ -109,7 +113,7 @@ function childInfoFor(result: unknown, sessionID: string): AssociationEventInfo 
 // ---------------------------------------------------------------------------
 
 export function createEventHook(deps: EventHookDeps): EventHook {
-  const { coordinator, client, logger } = deps;
+  const { coordinator, client, logger, watchdog } = deps;
   const nowFn = deps.now ?? ((): number => Date.now());
   const startFallback = deps.startFallback;
   // P-02: sessions whose first ≤60s-reset 429 has already been tolerated.
@@ -156,6 +160,9 @@ export function createEventHook(deps: EventHookDeps): EventHook {
     const resolution = resolveAssociation(info, candidates);
     if (resolution.kind === "associate") {
       coordinator.bindTaskSession({ callID: resolution.callID, sessionID: event.sessionID });
+      watchdog?.stop(resolution.callID);
+      watchdog?.watch(event.sessionID);
+      watchdog?.bind(event.sessionID);
       return;
     }
     if (resolution.kind !== "tie") return;
@@ -169,6 +176,9 @@ export function createEventHook(deps: EventHookDeps): EventHook {
     const second = resolveAssociation(augmented, tied);
     if (second.kind === "associate") {
       coordinator.bindTaskSession({ callID: second.callID, sessionID: event.sessionID });
+      watchdog?.stop(second.callID);
+      watchdog?.watch(event.sessionID);
+      watchdog?.bind(event.sessionID);
     }
   }
 
@@ -296,6 +306,11 @@ export function createEventHook(deps: EventHookDeps): EventHook {
       // Re-entrancy: never act on events for fallback-owned sessions.
       const sessionID = eventSessionID(event);
       if (sessionID !== undefined && coordinator.isInternalSession(sessionID)) return;
+      if (sessionID !== undefined && coordinator.taskForSession(sessionID) !== undefined && isActivityEvent(event)) {
+        if (event.kind === "permission.updated") watchdog?.permissionPending(sessionID, true);
+        if (event.kind === "permission.replied") watchdog?.permissionPending(sessionID, false);
+        watchdog?.activity(sessionID);
+      }
 
       switch (event.kind) {
         case "session.created":
