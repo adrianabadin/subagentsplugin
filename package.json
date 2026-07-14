@@ -16,7 +16,7 @@
     }
   },
   "bin": {
-    "model-forecast": "./dist/cli.js"
+    "model-forecast": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -48,12 +48,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aabadin/opencode-model-forecast.git"
+    "url": "git+https://github.com/adrianabadin/subagentsplugin.git"
   },
   "bugs": {
-    "url": "https://github.com/aabadin/opencode-model-forecast/issues"
+    "url": "https://github.com/adrianabadin/subagentsplugin/issues"
   },
-  "homepage": "https://github.com/aabadin/opencode-model-forecast#readme",
+  "homepage": "https://github.com/adrianabadin/subagentsplugin#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
