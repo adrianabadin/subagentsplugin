@@ -9,13 +9,22 @@ export class Logger {
   constructor(
     readonly projectName: string,
     readonly projectDir: string,
-    private readonly options: { verbose?: boolean } = {},
+    private readonly options: {
+      verbose?: boolean;
+      /** Test/integration seam for deterministic structured-log persistence. */
+      writeLog?: (line: string) => Promise<void> | void;
+    } = {},
   ) {}
 
-  private async write(level: "trace" | "info" | "warn" | "error", fn: string, message: string): Promise<void> {
+  private async write(
+    level: "trace" | "info" | "warn" | "error",
+    fn: string,
+    message: string,
+    options: { stderr?: boolean } = {},
+  ): Promise<void> {
     const timestamp = new Date().toISOString();
     const line = `${timestamp} [model-forecast] [${this.projectName}] [${fn}] ${message}`;
-    if (level === "error" || this.options.verbose === true) {
+    if (level === "error" || (this.options.verbose === true && options.stderr !== false)) {
       try {
         process.stderr.write(`${line}\n`);
       } catch {
@@ -23,6 +32,10 @@ export class Logger {
       }
     }
     try {
+      if (this.options.writeLog !== undefined) {
+        await Promise.resolve(this.options.writeLog(`${line}\n`));
+        return;
+      }
       await mkdir(LOG_DIR, { recursive: true });
       await appendFile(LOG_PATH, `${line}\n`, "utf8");
     } catch {
@@ -38,8 +51,8 @@ export class Logger {
     void this.write("info", fn, message);
   }
 
-  warn(fn: string, message: string): void {
-    void this.write("warn", fn, message);
+  warn(fn: string, message: string, options: { stderr?: boolean } = {}): void {
+    void this.write("warn", fn, message, options);
   }
 
   error(fn: string, message: string): void {
