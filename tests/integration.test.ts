@@ -166,9 +166,16 @@ describe("integration — plugin entry + CLI regression pin (PR3 task 3.1)", () 
       allowlist: ["sdd-design"],
       denylist: [],
       resolveCandidates: () => candidates,
+      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
     };
 
-    const hooks = await modelForecastPlugin(undefined, options);
+    const hooks = await modelForecastPlugin(
+      { client: buildMockClient("openai", "gpt-5.5", ["high"]) },
+      options,
+    );
+    await (hooks.config as (config: { agent: Record<string, unknown> }) => Promise<void>)({
+      agent: {},
+    });
     const hook = hooks["tool.execute.before"] as (
       input: { tool: { id: string }; sessionID: string; callID: string },
       output: { args: Record<string, unknown> },
@@ -332,6 +339,12 @@ describe("integration — PR2 gate W1: real select() through createTaskHook prod
         select: defaultSelect,
         resolveCandidates: () => candidates,
         audit,
+        getLiveAvailability: () => ({
+          ready: true,
+          models: new Set(["minimax/MiniMax-M3"]),
+          reason: "",
+          source: "provider-list",
+        }),
       },
     );
 

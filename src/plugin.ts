@@ -55,7 +55,12 @@ import { loadQuarantineFile } from "./cli-quarantine.js";
 import { loadEffectiveBenchmarks } from "./repo-data.js";
 import { DEFAULT_LADDER } from "./policy.js";
 import type { HooksConfig, ModelDataCache, SelectionMode } from "./types.js";
+import type { LiveAvailabilityState } from "./types.js";
 import type { ResolveCandidates } from "./hooks.js";
+import {
+  createInterruptionAuditSink,
+  type InterruptionAuditDependencies,
+} from "./interruption-audit.js";
 
 /**
  * Module-level dedupe state. Tracks the in-flight refresh keyed by
@@ -114,8 +119,9 @@ export interface PluginClient {
    * recursive fallback engine (`src/fallback.ts`). Mirrors
    * `client.session.create({body:{parentID?,title?}})` (sdk.gen.d.ts:114)
    * and `client.session.prompt({path:{id}, body:{model:{providerID,
-   * modelID}, agent, parts}})` (sdk.gen.d.ts:174). Deliberately loose/
-   * optional — no SDK type import — so a client missing either method
+   * modelID}, agent, parts}})` (sdk.gen.d.ts:174), plus optional
+   * `client.session.abort({path:{id}})` (sdk.gen.d.ts:150). Deliberately
+   * loose/optional — no SDK type import — so a client missing create/prompt
    * degrades the fallback engine to a graceful no-op instead of a crash.
    */
   session?: {
@@ -129,6 +135,9 @@ export interface PluginClient {
         agent: string;
         parts: Array<{ type: string; text: string }>;
       };
+    }) => Promise<unknown> | unknown;
+    abort?: (opts: {
+      path: { id: string };
     }) => Promise<unknown> | unknown;
   };
 }
@@ -242,6 +251,14 @@ export interface ModelForecastPluginOptions {
    */
   fallback?: {
     enabled?: boolean;
+  };
+  /**
+   * Integration seam for the real repository-local interruption sink.
+   * Production omits this and uses filesystem/stderr defaults; tests and
+   * embedders may inject individual dependencies without replacing the sink.
+   */
+  interruptionAudit?: {
+    dependencies?: Partial<InterruptionAuditDependencies>;
   };
   /**
    * Override the model-data cache path for the config hook fallback
@@ -369,6 +386,174 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       }, ms);
     }),
   ]);
+}
+
+/**
+ * Default timeout for the session-scoped live availability call. Mirrors
+ * the existing config-hook timeout so behaviour stays consistent across
+ * the two live SDK consumers in this module.
+ */
+const LIVE_AVAILABILITY_TIMEOUT_MS = 5_000;
+
+function unavailableLiveAvailabilityState(reason: string): LiveAvailabilityState {
+  return {
+    ready: false,
+    models: new Set<string>(),
+    reason,
+    source: "none",
+  };
+}
+
+/**
+ * Task 1.5 — pure derivation helper used by the config hook.
+ *
+ * Given the outcome of the config hook's bound, timeout-protected
+ * `client.provider.list()` call (or the absence of a call when the
+ * client / provider / list is missing), returns a fresh
+ * `LiveAvailabilityState`. Does NOT make any SDK call itself.
+ *
+ * Truthful rules:
+ *   - `ready: true` with a case-preserving `Set<provider/model>` ONLY
+ *     after a successful, parseable live call (`source: "provider-list"`).
+ *   - `ready: false` with a `reason` on every other path
+ *     (`source: "none"`): no client, missing provider, missing list,
+ *     sync throw, rejected promise, timeout, malformed / empty result.
+ *   - The cache (gentle-ai / opencode file) is intentionally NOT
+ *     consulted — readiness is the live session's signal only.
+ *   - Never throws.
+ */
+export function deriveLiveAvailabilityState(args: {
+  client: PluginClient | undefined;
+  listResult?: unknown;
+  listError?: unknown;
+  listCallNotMade?: boolean;
+}): LiveAvailabilityState {
+  if (args.client === undefined) {
+    return unavailableLiveAvailabilityState("no client at config time");
+  }
+  const provider = args.client.provider;
+  if (provider === undefined || provider === null) {
+    return unavailableLiveAvailabilityState("client.provider missing");
+  }
+  const listFn = provider.list;
+  if (typeof listFn !== "function") {
+    return unavailableLiveAvailabilityState("client.provider.list missing");
+  }
+  if (args.listCallNotMade === true) {
+    return unavailableLiveAvailabilityState("provider.list not invoked");
+  }
+  if (args.listError !== undefined) {
+    const msg = args.listError instanceof Error ? args.listError.message : String(args.listError);
+    if (/timed out/i.test(msg)) {
+      return unavailableLiveAvailabilityState(`provider.list timed out: ${msg}`);
+    }
+    return unavailableLiveAvailabilityState(`provider.list threw: ${msg}`);
+  }
+  if (args.listResult === undefined) {
+    return unavailableLiveAvailabilityState("provider.list returned no result");
+  }
+
+  const providerList = extractProviderList(args.listResult);
+  if (!Array.isArray(providerList) || providerList.length === 0) {
+    return unavailableLiveAvailabilityState("provider.list returned no models");
+  }
+
+  const models = new Set<string>();
+  for (const prov of providerList) {
+    if (!prov || typeof prov !== "object") continue;
+    const providerId = (prov as { id?: unknown }).id;
+    if (typeof providerId !== "string" || providerId.length === 0) continue;
+    const provModels = (prov as { models?: unknown }).models;
+    if (!provModels || typeof provModels !== "object") continue;
+    for (const modelId of Object.keys(provModels as Record<string, unknown>)) {
+      if (modelId.length === 0) continue;
+      // CASE-PRESERVING — match exactly what the live SDK returned so
+      // downstream consumers can stay defensive about casing.
+      models.add(`${providerId}/${modelId}`);
+    }
+  }
+
+  if (models.size === 0) {
+    return unavailableLiveAvailabilityState("provider.list had no usable provider/model entries");
+  }
+
+  return {
+    ready: true,
+    models,
+    reason: "",
+    source: "provider-list",
+  };
+}
+
+/**
+ * Task 1 — captures the session-scoped live availability state.
+ *
+ * Convenience wrapper that MAKES the bound, timeout-protected
+ * `client.provider.list()` call itself (same this-binding + timeout
+ * pattern the config hook uses), then delegates to
+ * `deriveLiveAvailabilityState`. Useful for callers that do NOT
+ * already have a live call in flight — the plugin entry's config
+ * hook has its own live call and should use the pure derivation
+ * helper directly instead.
+ *
+ * Never throws. Cache (gentle-ai / opencode file) is NOT consulted.
+ *
+ * Kept exported for direct unit-testability (Task 1 test surface).
+ */
+export async function computeLiveAvailabilityState(args: {
+  client?: PluginClient;
+  timeoutMs?: number;
+  logger?: Logger;
+}): Promise<LiveAvailabilityState> {
+  const timeoutMs = args.timeoutMs ?? LIVE_AVAILABILITY_TIMEOUT_MS;
+
+  if (args.client === undefined) {
+    args.logger?.info("liveAvailability", "unavailable: no client");
+    return deriveLiveAvailabilityState({ client: args.client });
+  }
+  const provider = args.client.provider;
+  if (provider === undefined || provider === null) {
+    args.logger?.info("liveAvailability", "unavailable: client.provider missing");
+    return deriveLiveAvailabilityState({ client: args.client });
+  }
+  const listFn = provider.list;
+  if (typeof listFn !== "function") {
+    args.logger?.info("liveAvailability", "unavailable: client.provider.list missing");
+    return deriveLiveAvailabilityState({ client: args.client });
+  }
+
+  let providerListResult: unknown;
+  try {
+    // this-binding: the SDK's `provider.list` is a class method that
+    // reads `this._client`. We invoke it bound to the provider instance
+    // so an unbound `this` does not throw — same pattern as the
+    // config-hook consumer below.
+    providerListResult = await withTimeout(
+      Promise.resolve(listFn.call(provider)),
+      timeoutMs,
+      "provider.list",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/timed out/i.test(msg)) {
+      args.logger?.info("liveAvailability", `unavailable: timeout after ${timeoutMs}ms`);
+    } else {
+      args.logger?.info("liveAvailability", `unavailable: ${msg}`);
+    }
+    return deriveLiveAvailabilityState({ client: args.client, listError: err });
+  }
+
+  const state = deriveLiveAvailabilityState({
+    client: args.client,
+    listResult: providerListResult,
+  });
+  args.logger?.info(
+    "liveAvailability",
+    state.ready
+      ? `ready models=${state.models.size} source=provider-list`
+      : `unavailable: ${state.reason}`,
+  );
+  return state;
 }
 
 /**
@@ -549,7 +734,7 @@ export async function refreshCache(
  * directly call `hooks["tool.execute.before"]` continue to pass.
  */
 function wrapTaskHookForTrace(inner: TaskHook, logger?: Logger): TaskHook {
-  return async (input, output) => {
+  const wrapped: TaskHook = async (input, output) => {
     if (toolID(input?.tool) === "task") {
       const raw =
         typeof output?.args?.subagent_type === "string"
@@ -571,6 +756,14 @@ function wrapTaskHookForTrace(inner: TaskHook, logger?: Logger): TaskHook {
     }
     await inner(input, output);
   };
+  // Task 1.5 — propagate the live availability GETTER through the
+  // trace wrapper so downstream consumers/tests that read
+  // `hooks["tool.execute.before"].getLiveAvailability()` still
+  // observe the live state threaded from the plugin entry. The
+  // wrapper must NOT cache the value — keeping the same closure
+  // reference guarantees every read returns the current state.
+  wrapped.getLiveAvailability = inner.getLiveAvailability;
+  return wrapped;
 }
 
 /**
@@ -606,6 +799,10 @@ export default async function modelForecastPlugin(
 
   const { name: projectName, dir: projectDir } = extractProjectInfo(input as Record<string, unknown> | undefined);
   const logger = new Logger(projectName, projectDir, { verbose: options?.verbose === true });
+  const interruptionAudit = createInterruptionAuditSink(
+    projectDir,
+    options?.interruptionAudit?.dependencies,
+  );
 
   const hookConfig = pluginHooksConfig(options);
   // Visibility — one stderr line per plugin load so the user can
@@ -669,6 +866,45 @@ export default async function modelForecastPlugin(
     watchQuarantineFile(quarantineFilePath, quarantine, logger);
   }
 
+  // Task 1 — session-scoped live availability state.
+  //
+  // Spec (Task 1.5 fix): the state is captured ONLY from the config
+  // hook's existing bound, timeout-protected `client.provider.list()`
+  // call. We do NOT eagerly capture it here at plugin init (a) because
+  // OpenCode typically hasn't loaded providers yet, producing a
+  // permanently unavailable state, and (b) because doing so would
+  // duplicate the SDK call the config hook also makes.
+  //
+  // The state starts unavailable with a short reason and the config
+  // hook updates it from the outcome of its own live call. The
+  // `getLiveAvailability` closure reads the CURRENT value on every
+  // call so the task hook always observes the latest state (not a
+  // stale reference taken at construction time).
+  let liveAvailability = unavailableLiveAvailabilityState("config hook not yet called");
+  let latestConfigInvocation = 0;
+  const getLiveAvailability = (): Readonly<LiveAvailabilityState> => liveAvailability;
+  const setLiveAvailability = (
+    invocation: number,
+    next: LiveAvailabilityState,
+  ): void => {
+    // Last-invocation-wins: a slower earlier config call must never
+    // overwrite availability established by a newer invocation.
+    if (invocation !== latestConfigInvocation) {
+      logger.trace(
+        "liveAvailability",
+        `ignored stale config invocation=${invocation}; latest=${latestConfigInvocation}`,
+      );
+      return;
+    }
+    liveAvailability = next;
+    logger.info(
+      "liveAvailability",
+      next.ready
+        ? `ready models=${next.models.size} source=${next.source}`
+        : `unavailable: ${next.reason}`,
+    );
+  };
+
   const generatedProfileResolver = createGeneratedProfileResolver(
     profileCatalog,
     { ...(quarantineEnabled ? { quarantine } : {}), logger },
@@ -698,7 +934,7 @@ export default async function modelForecastPlugin(
       ladder: DEFAULT_LADDER,
       logger,
       ...(client !== undefined
-        ? { fallback: { client, enabled: fallbackEnabled } }
+        ? { fallback: { client, enabled: fallbackEnabled, interruptionAudit } }
         : {}),
       // Visibility: mirror the loud-advisory stderr line AND surface it
       // on-screen. The after hook emits this ONCE per quarantine event
@@ -717,15 +953,29 @@ export default async function modelForecastPlugin(
 
   const hooks: Record<string, unknown> = {
     config: async (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
-      // Only clear TTL-based quarantines (rate limits); permanent quarantines
-      // (provider/billing errors) persist across plugin restarts.
-      quarantine.clearNonPermanent();
-      if (options?.generatedProfiles?.enabled === false) return;
+      const invocation = ++latestConfigInvocation;
+      // Fail closed immediately. This invalidates any prior ready snapshot
+      // before generated-profile gating or pre-provider setup can fail.
+      setLiveAvailability(
+        invocation,
+        unavailableLiveAvailabilityState("provider.list not yet settled for this config invocation"),
+      );
+      let providerListAttempted = false;
       // OpenCode AWAITS the config hook; any rejection here surfaces as a
       // structured `Cause { failures: [...] }` and aborts startup. Wrap the
       // ENTIRE body so profile generation is strictly best-effort and can
       // never break config resolution.
       try {
+        // Only clear TTL-based quarantines (rate limits); permanent quarantines
+        // (provider/billing errors) persist across plugin restarts.
+        quarantine.clearNonPermanent();
+        if (options?.generatedProfiles?.enabled === false) {
+          setLiveAvailability(
+            invocation,
+            unavailableLiveAvailabilityState("generated profiles are disabled"),
+          );
+          return;
+        }
         const hasInputDirectory =
           input !== null &&
           typeof input === "object" &&
@@ -753,23 +1003,44 @@ export default async function modelForecastPlugin(
         // a bare reference and calling it (`listFn()`) loses the `this`
         // binding and throws `Cannot read properties of undefined` INSIDE
         // the SDK. We therefore invoke it bound to the provider instance.
+        //
+        // Task 1.5: the SAME call result is reused to update the
+        // session-scoped live availability state. No duplicate SDK call.
         const provider = client?.provider;
         const listFn = provider?.list;
         if (typeof listFn !== "function") {
           reason = client === undefined ? "no client at config time" : "provider.list unavailable";
+          setLiveAvailability(
+            invocation,
+            deriveLiveAvailabilityState({ client, listCallNotMade: true }),
+          );
         } else {
+          let listResult: unknown;
+          let listError: unknown;
           try {
-            const listResult = await withTimeout(
+            providerListAttempted = true;
+            listResult = await withTimeout(
               Promise.resolve(listFn.call(provider)),
-              5000,
+              LIVE_AVAILABILITY_TIMEOUT_MS,
               "provider.list",
             );
             connectedModels = connectedModelsFromProviderList(extractProviderList(listResult));
             if (connectedModels.length === 0) reason = "provider.list returned no models";
           } catch (err) {
+            listError = err;
             reason = `provider.list threw: ${err instanceof Error ? err.message : String(err)}`;
             connectedModels = [];
           }
+          // Update the session-scoped live availability state from this
+          // call's outcome. The pure derivation helper turns success /
+          // failure / timeout / malformed / empty into the right state.
+          setLiveAvailability(
+            invocation,
+            deriveLiveAvailabilityState({
+              client,
+              ...(listError !== undefined ? { listError } : { listResult }),
+            }),
+          );
         }
         // Fallback: when the live provider list is empty/unavailable at config
         // time (OpenCode starts providers after the config hook fires), read
@@ -833,12 +1104,21 @@ export default async function modelForecastPlugin(
           );
         }
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!providerListAttempted) {
+          setLiveAvailability(
+            invocation,
+            unavailableLiveAvailabilityState(
+              `config hook failed before provider.list: ${message}`,
+            ),
+          );
+        }
         // Absorb any unexpected failure (e.g. a non-mutable config object)
         // so the config hook resolves and OpenCode does not report a
         // startup `Cause` failure. Best-effort, logged to stderr only.
         logger.error(
           "config",
-          `hook failed: ${err instanceof Error ? err.message : String(err)}`,
+          `hook failed: ${message}`,
         );
       }
     },
@@ -846,8 +1126,9 @@ export default async function modelForecastPlugin(
       createTaskHook(hookConfig, {
         resolveCandidates: options?.resolveCandidates ?? generatedProfileResolver,
         logger,
-        ...(quarantineEnabled ? { tracking } : {}),
+        ...(quarantineEnabled ? { tracking, quarantine } : {}),
         ...(fallbackSessionIDs !== undefined ? { fallbackSessionIDs } : {}),
+        getLiveAvailability,
       }),
       logger,
     ),

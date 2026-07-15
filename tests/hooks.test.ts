@@ -4,6 +4,7 @@ import { createAfterHook, createTaskHook, detectRateLimit, parseGeneratedAlias, 
 import { QuarantineStore, type QuarantineBlocklist } from "../src/quarantine.js";
 import { generatedProfileAlias } from "../src/profiles.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
+import { Logger } from "../src/logger.js";
 import type { AuditEntry, LadderRung, SelectDecision } from "../src/types.js";
 
 function decision(overrides: Partial<SelectDecision> = {}): SelectDecision {
@@ -16,6 +17,15 @@ function decision(overrides: Partial<SelectDecision> = {}): SelectDecision {
     confidence: 0.8,
     evidence: "test evidence",
     ...overrides,
+  };
+}
+
+function readyAvailabilityFor(...models: string[]) {
+  return {
+    ready: true,
+    models: new Set(models),
+    reason: "",
+    source: "provider-list" as const,
   };
 }
 
@@ -33,6 +43,7 @@ describe("createTaskHook()", () => {
       {
         select: () => decision(),
         audit,
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -56,6 +67,7 @@ describe("createTaskHook()", () => {
       {
         select: () => decision(),
         audit,
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -79,6 +91,7 @@ describe("createTaskHook()", () => {
       {
         select: () => decision(),
         audit,
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -152,6 +165,7 @@ describe("createTaskHook()", () => {
       {
         select: () => decision(),
         audit,
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -184,6 +198,7 @@ describe("createTaskHook()", () => {
       {
         select: () => decision(),
         audit,
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -397,6 +412,355 @@ describe("createTaskHook()", () => {
       }),
     );
   });
+});
+
+describe("createTaskHook() — final live authorization refusal", () => {
+  const config = {
+    mode: "auto" as const,
+    confidenceThreshold: 0.6,
+    ladder: ["minimax", "google-antigravity", "openai", "glm-5.2", "anthropic"] as const,
+    allowlist: ["sdd-design"],
+    denylist: [],
+  };
+
+  function readyLive(...models: string[]) {
+    return {
+      ready: true,
+      models: new Set(models),
+      reason: "",
+      source: "provider-list" as const,
+    };
+  }
+
+  function unavailableLive(reason = "provider.list timed out") {
+    return {
+      ready: false,
+      models: new Set<string>(),
+      reason,
+      source: "none" as const,
+    };
+  }
+
+  function output() {
+    return { args: { subagent_type: "sdd-design", prompt: "work" } };
+  }
+
+  it("rewrites and tracks only an exact live, non-quarantined switch", async () => {
+    const tracking = new Map<string, unknown>();
+    const audit = vi.fn();
+    const warnSink = vi.fn();
+    const quarantine = { isBlocked: vi.fn(() => false) };
+    const hook = createTaskHook(config, {
+      select: () => decision(),
+      tracking: tracking as never,
+      quarantine,
+      getLiveAvailability: () => readyLive("openai/gpt-5.5"),
+      audit,
+      warnSink,
+    });
+    const result = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "eligible" }, result);
+
+    expect(quarantine.isBlocked).toHaveBeenCalledOnce();
+    expect(quarantine.isBlocked).toHaveBeenCalledWith("openai/gpt-5.5");
+    expect(result.args.subagent_type).toBe("sdd-design-alto");
+    expect(tracking.get("eligible")).toMatchObject({
+      originalSubagentType: "sdd-design",
+      targetAlias: "sdd-design-alto",
+      model: "openai/gpt-5.5",
+    });
+    expect(warnSink).not.toHaveBeenCalled();
+    expect(audit).toHaveBeenCalledOnce();
+    expect(audit.mock.calls[0]?.[0]).not.toHaveProperty("refusalCause");
+  });
+
+  it("refuses an exact quarantined switch once without tracking or another candidate", async () => {
+    const tracking = new Map<string, unknown>();
+    const audit = vi.fn();
+    const warnSink = vi.fn();
+    const select = vi.fn(() => decision());
+    const hook = createTaskHook(config, {
+      select,
+      tracking: tracking as never,
+      quarantine: { isBlocked: (model) => model === "openai/gpt-5.5" },
+      getLiveAvailability: () => readyLive("openai/gpt-5.5", "openai/gpt-5.4"),
+      audit,
+      warnSink,
+    });
+    const result = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "quarantined" }, result);
+
+    expect(select).toHaveBeenCalledOnce();
+    expect(result.args.subagent_type).toBe("sdd-design");
+    expect(tracking.size).toBe(0);
+    expect(warnSink).toHaveBeenCalledOnce();
+    expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*candidate_quarantined/));
+    expect(audit).toHaveBeenCalledOnce();
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({
+      refusalCause: "candidate_quarantined",
+      decision: {
+        action: "keep-default",
+        model: "openai/gpt-5.5",
+      },
+    });
+  });
+
+  it("refuses a switch when the current live snapshot is unavailable", async () => {
+    const tracking = new Map<string, unknown>();
+    const audit = vi.fn();
+    const warnSink = vi.fn();
+    const hook = createTaskHook(config, {
+      select: () => decision(),
+      tracking: tracking as never,
+      quarantine: { isBlocked: () => false },
+      getLiveAvailability: () => unavailableLive(),
+      audit,
+      warnSink,
+    });
+    const result = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "unavailable" }, result);
+
+    expect(result.args.subagent_type).toBe("sdd-design");
+    expect(tracking.size).toBe(0);
+    expect(warnSink).toHaveBeenCalledOnce();
+    expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*live_snapshot_unavailable/));
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({
+      refusalCause: "live_snapshot_unavailable",
+      decision: { action: "keep-default" },
+    });
+  });
+
+  it("refuses a switch whose exact case-preserving key is absent from the live snapshot", async () => {
+    const tracking = new Map<string, unknown>();
+    const audit = vi.fn();
+    const warnSink = vi.fn();
+    const hook = createTaskHook(config, {
+      select: () => decision(),
+      tracking: tracking as never,
+      quarantine: { isBlocked: () => false },
+      getLiveAvailability: () => readyLive("OpenAI/gpt-5.5", "openai/GPT-5.5"),
+      audit,
+      warnSink,
+    });
+    const result = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "not-live" }, result);
+
+    expect(result.args.subagent_type).toBe("sdd-design");
+    expect(tracking.size).toBe(0);
+    expect(warnSink).toHaveBeenCalledOnce();
+    expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*candidate_not_live/));
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({
+      refusalCause: "candidate_not_live",
+      decision: { action: "keep-default" },
+    });
+  });
+
+  it("does not use provider families or aliases to block or authorize a switch", async () => {
+    const tracking = new Map<string, unknown>();
+    const quarantine = new QuarantineStore({ now: () => 1_700_000_000 });
+    quarantine.addManual("xiaomi/mimo-v2.5-pro", "exact route only", { permanent: true });
+    const isBlocked = vi.spyOn(quarantine, "isBlocked");
+    const hook = createTaskHook(config, {
+      select: () => decision({ model: "crof/mimo-v2.5-pro" }),
+      tracking: tracking as never,
+      quarantine,
+      getLiveAvailability: () => readyLive("crof/mimo-v2.5-pro"),
+    });
+    const allowed = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "crof-live" }, allowed);
+
+    expect(isBlocked).toHaveBeenCalledWith("crof/mimo-v2.5-pro");
+    expect(quarantine.isBlocked("crof/mimo-v2.5-pro")).toBe(false);
+    expect(allowed.args.subagent_type).toBe("sdd-design-alto");
+    expect(tracking.has("crof-live")).toBe(true);
+
+    const audit = vi.fn();
+    const warnSink = vi.fn();
+    const notAuthorized = createTaskHook(config, {
+      select: () => decision({ model: "crof/mimo-v2.5-pro" }),
+      tracking: new Map() as never,
+      quarantine: { isBlocked: () => false },
+      getLiveAvailability: () => readyLive("xiaomi/mimo-v2.5-pro"),
+      audit,
+      warnSink,
+    });
+    const refused = output();
+
+    await notAuthorized({ tool: "task", sessionID: "s1", callID: "xiaomi-only" }, refused);
+
+    expect(refused.args.subagent_type).toBe("sdd-design");
+    expect(warnSink).toHaveBeenCalledOnce();
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({ refusalCause: "candidate_not_live" });
+  });
+
+  it("keeps the original type when a malicious resolver mutates its args before refusal", async () => {
+    const tracking = new Map<string, unknown>();
+    const audit = vi.fn();
+    const hook = createTaskHook(config, {
+      resolveCandidates: ({ args }) => {
+        try {
+          (args as Record<string, unknown>).subagent_type = "malicious-agent";
+        } catch {
+          // An immutable resolver snapshot may reject the mutation.
+        }
+        return [
+          {
+            subagent_type: "sdd-design-alto",
+            model: "openai/not-live",
+            effort: "high",
+            confidence: 0.95,
+            evidence: "test",
+            ladderRung: "openai",
+          },
+        ];
+      },
+      tracking: tracking as never,
+      quarantine: { isBlocked: () => false },
+      getLiveAvailability: () => readyLive("openai/gpt-5.5"),
+      audit,
+      warnSink: vi.fn(),
+    });
+    const result = output();
+
+    await hook({ tool: "task", sessionID: "s1", callID: "malicious-resolver" }, result);
+
+    expect(result.args.subagent_type).toBe("sdd-design");
+    expect(tracking.size).toBe(0);
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({
+      refusalCause: "candidate_not_live",
+      decision: { action: "keep-default", model: "openai/not-live" },
+    });
+  });
+
+  it("isolates nested task args from malicious resolver mutation before refusal", async () => {
+    const audit = vi.fn();
+    const hook = createTaskHook(config, {
+      resolveCandidates: ({ args }) => {
+        const metadata = args.metadata as {
+          routing: { requestedType: string; tags: string[] };
+        };
+        try {
+          metadata.routing.requestedType = "malicious-agent";
+        } catch {
+          // A deeply immutable resolver snapshot may reject the mutation.
+        }
+        try {
+          metadata.routing.tags.push("mutated");
+        } catch {
+          // Arrays in a deeply immutable snapshot may reject mutation too.
+        }
+        return [
+          {
+            subagent_type: "sdd-design-alto",
+            model: "openai/not-live",
+            effort: "high",
+            confidence: 0.95,
+            evidence: "test",
+            ladderRung: "openai",
+          },
+        ];
+      },
+      quarantine: { isBlocked: () => false },
+      getLiveAvailability: () => readyLive("openai/gpt-5.5"),
+      audit,
+      warnSink: vi.fn(),
+    });
+    const result = {
+      args: {
+        subagent_type: "sdd-design",
+        prompt: "work",
+        metadata: {
+          routing: {
+            requestedType: "sdd-design",
+            tags: ["original"],
+          },
+        },
+      },
+    };
+
+    await hook({ tool: "task", sessionID: "s1", callID: "nested-resolver" }, result);
+
+    expect(result.args.subagent_type).toBe("sdd-design");
+    expect(result.args.metadata).toEqual({
+      routing: {
+        requestedType: "sdd-design",
+        tags: ["original"],
+      },
+    });
+    expect(audit.mock.calls[0]?.[0]).toMatchObject({
+      refusalCause: "candidate_not_live",
+    });
+  });
+
+  it("emits one visible verbose refusal diagnostic and persists the structured warning", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const persisted: string[] = [];
+    try {
+      const hook = createTaskHook(config, {
+        select: () => decision(),
+        quarantine: { isBlocked: () => true },
+        getLiveAvailability: () => readyLive("openai/gpt-5.5"),
+        logger: new Logger("task-2-test", process.cwd(), {
+          verbose: true,
+          writeLog: (line) => {
+            persisted.push(line);
+          },
+        }),
+      });
+      const result = output();
+
+      await hook({ tool: "task", sessionID: "s1", callID: "verbose-refusal" }, result);
+
+      const visibleRefusals = stderrSpy.mock.calls
+        .map((call) => (typeof call[0] === "string" ? call[0] : ""))
+        .filter((line) => line.includes("candidate_quarantined"));
+      expect(result.args.subagent_type).toBe("sdd-design");
+      expect(visibleRefusals).toHaveLength(1);
+      expect(persisted.filter((line) => line.includes("candidate_quarantined"))).toHaveLength(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it.each(["logger", "warnSink", "audit"] as const)(
+    "%s sink errors keep a refused switch effective",
+    async (failingSink) => {
+      const tracking = new Map<string, unknown>();
+      const audit = failingSink === "audit"
+        ? vi.fn().mockRejectedValue(new Error("audit failed"))
+        : vi.fn();
+      const warnSink = failingSink === "warnSink"
+        ? vi.fn(() => { throw new Error("warn failed"); })
+        : vi.fn();
+      const logger = {
+        info: vi.fn(),
+        warn: failingSink === "logger"
+          ? vi.fn(() => { throw new Error("logger failed"); })
+          : vi.fn(),
+      };
+      const hook = createTaskHook(config, {
+        select: () => decision(),
+        tracking: tracking as never,
+        quarantine: { isBlocked: () => true },
+        getLiveAvailability: () => readyLive("openai/gpt-5.5"),
+        audit,
+        warnSink,
+        logger: logger as never,
+      });
+      const result = output();
+
+      await expect(
+        hook({ tool: "task", sessionID: "s1", callID: `sink-${failingSink}` }, result),
+      ).resolves.toBeUndefined();
+      expect(result.args.subagent_type).toBe("sdd-design");
+      expect(tracking.size).toBe(0);
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------- *
@@ -889,6 +1253,13 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
     };
   }
 
+  const getLiveAvailability = () => ({
+    ready: true,
+    models: new Set(["openai/gpt-4.1-mini"]),
+    reason: "",
+    source: "provider-list" as const,
+  });
+
   it("populates tracking.set(callID, …) on a switch decision", async () => {
     const tracking = new Map<string, unknown>();
     const hook = createTaskHook(
@@ -902,6 +1273,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       {
         select: () => decision(),
         tracking: tracking as never,
+        getLiveAvailability,
       },
     );
 
@@ -930,6 +1302,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       {
         select: () => decision({ action: "keep-default", subagent_type: "" }),
         tracking: tracking as never,
+        getLiveAvailability,
       },
     );
 
@@ -952,6 +1325,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       {
         select: () => decision(),
         tracking: tracking as never,
+        getLiveAvailability,
       },
     );
 
@@ -974,6 +1348,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       {
         select: () => decision(),
         tracking: tracking as never,
+        getLiveAvailability,
       },
     );
 
@@ -1380,6 +1755,7 @@ describe("createTaskHook() — fallback-session re-entrancy guard (before-hook)"
       {
         fallbackSessionIDs,
         select: () => decision(),
+        getLiveAvailability: () => readyAvailabilityFor("openai/gpt-5.5"),
       },
     );
 
@@ -1447,6 +1823,56 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
     });
     // The failing model must be quarantined (existing attempt-1 path).
     expect(quarantine.isBlocked("openai/gpt-4.1-mini")).toBe(true);
+  });
+
+  it("surfaces explicit child cancellation without retrying, aborting, or marking fallback exhausted", async () => {
+    const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
+    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({
+      "sdd-design": [
+        { modelId: "openai/gpt-4.1-mini" },
+        { modelId: "minimax/M3" },
+        { modelId: "google/gemini-x" },
+      ],
+    });
+    const cancellation = Object.assign(new Error("cancelled"), { name: "AbortError" });
+    const abort = vi.fn();
+    const interruptionAudit = vi.fn();
+    const client = {
+      session: {
+        create: vi.fn(async () => ({ id: "child-1" })),
+        prompt: vi.fn(async () => Promise.reject(cancellation)),
+        abort,
+      },
+    };
+    const hook = createAfterHook({
+      quarantine,
+      tracking: tracking as never,
+      catalog: catalog as never,
+      ladder: DEFAULT_LADDER,
+      fallback: { client, enabled: true, interruptionAudit },
+    });
+    const output: { output?: unknown; metadata?: unknown } = {
+      output: "upstream returned HTTP 429 Too Many Requests",
+    };
+
+    await hook({ tool: { id: "task" }, sessionID: "parent-session", callID: "c1" }, output);
+
+    expect(output.output).toBe(
+      "[model-forecast] FALLBACK CANCELLED: child prompt cancelled for sdd-design.",
+    );
+    expect(output.metadata).toMatchObject({
+      mfFallback: { cancelled: true },
+    });
+    expect(output.metadata).not.toMatchObject({
+      mfFallback: { exhausted: true },
+    });
+    expect(client.session.create).toHaveBeenCalledOnce();
+    expect(client.session.prompt).toHaveBeenCalledOnce();
+    expect(abort).not.toHaveBeenCalled();
+    expect(interruptionAudit).not.toHaveBeenCalled();
+    expect(quarantine.isBlocked("minimax/M3")).toBe(false);
   });
 
   it("on exhaustion, overwrites output.output with the terminal error and sets metadata.mfFallback.exhausted", async () => {

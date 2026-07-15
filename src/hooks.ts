@@ -16,6 +16,9 @@
  *           (recursion guard),
  *       (e) the selection policy produces a switch decision whose
  *           subagent_type is non-empty AND model is NOT denylisted.
+ *       (f) that exact model is not quarantined, and
+ *       (g) the current live snapshot is ready and contains that exact,
+ *           case-preserving provider/model key.
  *   - Refused rewrites MUST:
  *       (1) leave `subagent_type` unchanged,
  *       (2) emit a stderr warning (loud advisory per spec #1274 "Safe
@@ -43,7 +46,12 @@ import { select as defaultSelect } from "./select.js";
 import { DEFAULT_LADDER } from "./policy.js";
 import { MISSING_EVIDENCE_CONFIDENCE } from "./evidence.js";
 import { normalizePhase } from "./phases.js";
-import { QuarantineStore, resolveQuarantineTtlMs, type QuarantineErrorType } from "./quarantine.js";
+import {
+  QuarantineStore,
+  resolveQuarantineTtlMs,
+  type QuarantineBlocklist,
+  type QuarantineErrorType,
+} from "./quarantine.js";
 import {
   classifyError,
   extractResetHintMs,
@@ -60,14 +68,17 @@ import {
   type FallbackCatalogSlice,
 } from "./fallback.js";
 import type { Logger } from "./logger.js";
+import type { InterruptionAuditSink } from "./interruption-audit.js";
 import type {
   AuditEntry,
   HooksConfig,
   LadderRung,
+  LiveAvailabilityState,
   SelectCandidate,
   SelectDecision,
   SelectInput,
   SelectionPolicy,
+  SelectionRefusalCause,
   TaskContext,
 } from "./types.js";
 
@@ -81,7 +92,19 @@ interface HookOutput {
   args: Record<string, unknown>;
 }
 
-export type TaskHook = (input: HookInput, output: HookOutput) => Promise<void>;
+export type TaskHook = ((input: HookInput, output: HookOutput) => Promise<void>) & {
+  /**
+   * Exposes a defensive snapshot of the current live availability state.
+   * Every call reads the latest config-hook state and copies its model set,
+   * so consumers cannot mutate the set used by dispatch authorization.
+   *
+   * `undefined` when no live state was provided (or when the plugin
+   * entry was constructed without a client / live call). Downstream
+   * tests observe this property; Task 2 will consult it inside the
+   * hook to gate the final rewrite.
+   */
+  getLiveAvailability?: () => Readonly<LiveAvailabilityState> | undefined;
+};
 
 /**
  * Candidates factory: synthesises the candidate set the runner will
@@ -107,7 +130,7 @@ export interface ResolveCandidatesDeps {
   context: TaskContext;
   /** Resolved selection policy. */
   policy: SelectionPolicy;
-  /** Read-only handle to the hook args (for richer signal mining). */
+  /** Deeply isolated, frozen snapshot of the hook args (for richer signal mining). */
   args: Readonly<Record<string, unknown>>;
 }
 
@@ -165,6 +188,24 @@ export interface TaskHookDependencies {
    * (no re-entrancy risk to guard against).
    */
   fallbackSessionIDs?: ReadonlySet<string>;
+  /**
+   * Task 1 — session-scoped live availability state, threaded from
+   * the plugin entry as a GETTER (NOT a snapshot). The hook must
+   * always observe the value updated by the latest config-hook
+   * call. The final rewrite gate consults this state immediately before
+   * mutating the task output or creating tracking state. The getter is
+   * also exposed via `TaskHook.getLiveAvailability` for consumers/tests.
+   *
+   * `undefined` when no live state is available; the rewrite gate treats
+   * that as unavailable and fails closed.
+   */
+  getLiveAvailability?: () => Readonly<LiveAvailabilityState> | undefined;
+  /**
+   * Exact quarantine lookup used at the final rewrite boundary. Omitted
+   * only when quarantine is disabled; the selected model id is passed
+   * through unchanged, with no alias or family normalization.
+   */
+  quarantine?: QuarantineBlocklist;
 }
 
 export function toolID(tool: HookInput["tool"]): string {
@@ -266,6 +307,78 @@ function defaultWarnSink(message: string): void {
     process.stderr.write(`${message}\n`);
   } catch {
     // Never let the loud-advisory warning block the task.
+  }
+}
+
+function safeWarn(warnSink: (message: string) => void, message: string): void {
+  try {
+    warnSink(message);
+  } catch {
+    // A diagnostic failure must never weaken a refusal or break the task.
+  }
+}
+
+function safeLoggerWarn(logger: Logger | undefined, message: string): void {
+  try {
+    // The always-visible warnSink owns stderr for refusals. Keep the same
+    // structured warning in the plugin log without duplicating it in verbose
+    // mode, where Logger.warn would otherwise also write to stderr.
+    logger?.warn("createTaskHook", message, { stderr: false });
+  } catch {
+    // A logger failure must never weaken a refusal or break the task.
+  }
+}
+
+function defensiveLiveAvailabilitySnapshot(
+  state: Readonly<LiveAvailabilityState> | undefined,
+): Readonly<LiveAvailabilityState> | undefined {
+  if (state === undefined) return undefined;
+  return {
+    ...state,
+    models: new Set(state.models),
+  };
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return value;
+  }
+
+  const object = value as object;
+  if (seen.has(object)) return value;
+  seen.add(object);
+
+  for (const key of Reflect.ownKeys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (descriptor !== undefined && "value" in descriptor) {
+      deepFreeze(descriptor.value, seen);
+    }
+  }
+  return Object.freeze(value);
+}
+
+function isolatedResolverArgs(
+  args: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  try {
+    return deepFreeze(structuredClone(args));
+  } catch {
+    // Tool arguments are expected to be structured-cloneable. If a custom
+    // caller supplies an unsupported value (for example a function), retain
+    // cloneable top-level signals and drop only unsafe values rather than
+    // exposing any live object reference to the resolver.
+    const isolated: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      try {
+        isolated[key] = structuredClone(value);
+      } catch {
+        isolated[key] = undefined;
+      }
+    }
+    return deepFreeze(isolated);
   }
 }
 
@@ -442,6 +555,7 @@ export interface AfterHookDeps {
   fallback?: {
     client: FallbackClient;
     enabled?: boolean;
+    interruptionAudit?: InterruptionAuditSink;
   };
 }
 
@@ -520,9 +634,9 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
   const emit = warnSink ?? defaultWarnSink;
 
   // model-fallback-error-classification (SDD change) — Slice 3, task 24.
-  // The engine is constructed ONCE per hook (not per call) so its
-  // `fallbackSessionIDs` set persists for the lifetime of the plugin
-  // session — every child session it ever creates stays registered.
+  // The engine is constructed ONCE per hook (not per call) so active child
+  // IDs and bounded retired tombstones share one re-entrancy guard for the
+  // lifetime of the plugin without retaining every completed child forever.
   // `deps.fallback?.enabled` defaults to `true` when `fallback` is
   // supplied at all (design #1623 "Migration / Rollout" rollback plan:
   // `enabled: false` restores pre-Slice-3 audit-only behavior while
@@ -540,6 +654,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
           maxAttempts: 3,
           now,
           logger,
+          interruptionAudit: deps.fallback?.interruptionAudit,
         })
       : undefined;
 
@@ -641,6 +756,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
       prompt: tracked.prompt ?? "",
       failedModel: tracked.model,
       failureReason: reason,
+      callID,
     });
 
     const existingMetadata =
@@ -657,6 +773,16 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
       logger?.info(
         "createAfterHook",
         `fallback succeeded for ${tracked.originalSubagentType} on ${result.model} after ${result.attempts} attempt(s)`,
+      );
+    } else if (result.cancelled) {
+      output.output = result.output;
+      output.metadata = {
+        ...existingMetadata,
+        mfFallback: { cancelled: true, attempts: result.attempts },
+      };
+      logger?.info(
+        "createAfterHook",
+        `fallback cancelled for ${tracked.originalSubagentType}`,
       );
     } else {
       output.output = result.output;
@@ -700,7 +826,7 @@ export function createTaskHook(
   const now = deps.now ?? (() => new Date());
   const logger = deps.logger;
 
-  return async (input, output): Promise<void> => {
+  const hook: TaskHook = async (input, output): Promise<void> => {
     if (config.mode !== "auto") return;
     if (toolID(input.tool) !== "task") return;
     // model-fallback-error-classification (SDD change) — Slice 3, task 24.
@@ -745,13 +871,14 @@ export function createTaskHook(
     // production hook is non-inert; orchestrators can swap in richer
     // scoring via `deps.resolveCandidates`.
     let candidates: SelectCandidate[];
+    const resolverArgs = isolatedResolverArgs(output.args);
     try {
       candidates = resolveCandidates({
         originalSubagentType: original,
         ladder,
         context,
         policy,
-        args: output.args,
+        args: resolverArgs,
       });
     } catch {
       // A custom resolver MUST NOT break the task call. Fall through
@@ -766,7 +893,7 @@ export function createTaskHook(
         ladder,
         context,
         policy,
-        args: output.args,
+        args: resolverArgs,
       });
     }
 
@@ -796,6 +923,7 @@ export function createTaskHook(
 
     let finalDecision = decision;
     let refusedReason: string | null = null;
+    let refusalCause: SelectionRefusalCause | undefined;
 
     if (decision.action === "switch" && decision.subagent_type.length === 0) {
       finalDecision = keepDefaultFrom(decision, "alias ladder missing; keeping default");
@@ -804,6 +932,39 @@ export function createTaskHook(
     if (decision.action === "switch" && isDenylisted(decision.model, config.denylist)) {
       finalDecision = keepDefaultFrom(decision, "model denylisted; keeping default");
       refusedReason = `model ${decision.model} is in denylist`;
+    }
+
+    if (finalDecision.action === "switch") {
+      let quarantined = false;
+      try {
+        quarantined = deps.quarantine?.isBlocked(finalDecision.model) === true;
+      } catch {
+        // Fail closed when quarantine state cannot prove eligibility.
+        quarantined = true;
+      }
+
+      if (quarantined) {
+        refusalCause = "candidate_quarantined";
+        refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
+        finalDecision = keepDefaultFrom(finalDecision, refusedReason);
+      } else {
+        let liveAvailability: Readonly<LiveAvailabilityState> | undefined;
+        try {
+          liveAvailability = deps.getLiveAvailability?.();
+        } catch {
+          liveAvailability = undefined;
+        }
+
+        if (liveAvailability?.ready !== true) {
+          refusalCause = "live_snapshot_unavailable";
+          refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
+          finalDecision = keepDefaultFrom(finalDecision, refusedReason);
+        } else if (!liveAvailability.models.has(finalDecision.model)) {
+          refusalCause = "candidate_not_live";
+          refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
+          finalDecision = keepDefaultFrom(finalDecision, refusedReason);
+        }
+      }
     }
 
     if (finalDecision.action === "switch") {
@@ -829,15 +990,18 @@ export function createTaskHook(
         });
       }
     } else if (refusedReason !== null) {
-      logger?.warn(
-        "createTaskHook",
-        `refused auto-mode rewrite for "${original}" — ${refusedReason}; keeping default`,
+      const diagnostic =
+        `refused auto-mode rewrite for "${original}" — ${refusedReason}; keeping default`;
+      safeLoggerWarn(
+        logger,
+        diagnostic,
       );
       // PR3 S1 — loud advisory. Spec #1274 "Safe task rewrite" requires a
       // visible warning when auto mode refuses a rewrite. Audit captures
       // intent; stderr surfaces it to the orchestrator at runtime.
-      warnSink(
-        `model-forecast: refused auto-mode rewrite for "${original}" — ${refusedReason}; keeping default.`,
+      safeWarn(
+        warnSink,
+        `model-forecast: ${diagnostic}.`,
       );
     }
 
@@ -849,6 +1013,21 @@ export function createTaskHook(
       mode: config.mode,
       sessionID: input.sessionID,
       phaseMatched,
+      ...(refusalCause !== undefined ? { refusalCause } : {}),
     });
   };
+
+  // Expose the same live getter used by the final rewrite gate so
+  // downstream consumers/tests can observe the current state on every read.
+  hook.getLiveAvailability = deps.getLiveAvailability === undefined
+    ? undefined
+    : () => {
+        try {
+          return defensiveLiveAvailabilitySnapshot(deps.getLiveAvailability?.());
+        } catch {
+          return undefined;
+        }
+      };
+
+  return hook;
 }
