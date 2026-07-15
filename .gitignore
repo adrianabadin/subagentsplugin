@@ -5,6 +5,7 @@ coverage/
 .env
 .env.*
 *.log
+.opencode/logs/subagent-interruptions.jsonl
 
 .DS_Store
 .vscode/

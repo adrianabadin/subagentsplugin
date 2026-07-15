@@ -27,7 +27,7 @@ El plugin registrara las interrupciones que solicita directamente sobre sesiones
 Antes de cada `session.abort`, el plugin crea un registro de causalidad en memoria y escribe `abort_requested`. Luego ejecuta el abort con un deadline. El resultado se cierra con un evento adicional:
 
 - `abort_resolved`: el SDK resolvio la solicitud.
-- `abort_rejected`: el SDK rechazo la solicitud y se conserva el mensaje del error.
+- `abort_rejected`: el SDK rechazo la solicitud y se conserva un codigo cerrado y clasificado (`abort_rejected_bad_request`, `abort_rejected_not_found`, `abort_rejected_cancelled`, `abort_rejected_timeout`, `abort_rejected_transport` o `abort_rejected_unknown`), nunca el mensaje arbitrario del SDK.
 - `abort_timeout`: el SDK no resolvio dentro del deadline.
 
 Cada evento se escribe de forma independiente para que un proceso interrumpido deje al menos evidencia de la solicitud inicial. La salida del CLI usa el mismo registro, pero en formato humano y de una sola linea.
