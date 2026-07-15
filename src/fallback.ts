@@ -24,8 +24,10 @@
  *
  * Client shape is intentionally loose/structural (design #1623 "Client
  * wiring" — no SDK type import). `client.session.create` /
- * `client.session.prompt` are both optional; when either is missing the
- * engine degrades gracefully (treats the loop as immediately exhausted
+ * `client.session.prompt` are optional; `client.session.abort({path:{id}})`
+ * mirrors sdk.gen.d.ts:150 and is used only for failed/stalled prompts.
+ * When create or prompt is missing, the engine degrades gracefully
+ * (treats the loop as immediately exhausted
  * after the one attempt the caller already reports) instead of throwing.
  */
 
@@ -33,6 +35,14 @@ import { resolveQuarantineTtlMs, type QuarantineErrorType, type QuarantineStore 
 import type { ClassifiedError } from "./error-classification.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
+import type {
+  InterruptionAuditEvent,
+  InterruptionAuditSink,
+} from "./interruption-audit.js";
+
+const DEFAULT_PROMPT_TIMEOUT_MS = 300_000;
+const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
+const DEFAULT_FALLBACK_SESSION_TOMBSTONE_LIMIT = 256;
 
 /** A single fallback attempt record (used both mid-loop and in the terminal error). */
 export interface FallbackAttempt {
@@ -50,20 +60,31 @@ export interface FallbackSuccessResult {
 
 export interface FallbackExhaustedResult {
   success: false;
+  cancelled: false;
   /** The formatted "[model-forecast] FALLBACK EXHAUSTED: ..." terminal error string. */
   output: string;
   attempts: FallbackAttempt[];
 }
 
-export type FallbackResult = FallbackSuccessResult | FallbackExhaustedResult;
+export interface FallbackCancelledResult {
+  success: false;
+  cancelled: true;
+  output: string;
+  attempts: FallbackAttempt[];
+}
+
+export type FallbackResult =
+  | FallbackSuccessResult
+  | FallbackExhaustedResult
+  | FallbackCancelledResult;
 
 /**
  * Loose structural shape of the OpenCode SDK's `client.session` surface
  * that the engine needs. Mirrors `client.session.create({body:{parentID?,
  * title?}})` (sdk.gen.d.ts:114) and `client.session.prompt({path:{id},
  * body:{model:{providerID,modelID}, agent, parts}})` (sdk.gen.d.ts:174).
- * Both members are optional so a caller can pass a partial/absent client
- * without the engine crashing.
+ * All members are optional so a caller can pass a partial/absent client
+ * without the engine crashing; abort is never required for dispatch.
  */
 export interface FallbackSessionClient {
   create?: (opts: {
@@ -76,6 +97,9 @@ export interface FallbackSessionClient {
       agent: string;
       parts: Array<{ type: string; text: string }>;
     };
+  }) => Promise<unknown> | unknown;
+  abort?: (opts: {
+    path: { id: string };
   }) => Promise<unknown> | unknown;
 }
 
@@ -103,6 +127,11 @@ export interface FallbackEngineDeps {
   maxAttempts: number;
   now?: () => Date;
   logger?: Logger;
+  interruptionAudit?: InterruptionAuditSink;
+  promptTimeoutMs?: number;
+  abortTimeoutMs?: number;
+  /** Retired child IDs retained as bounded late-event tombstones. Active IDs are never evicted. */
+  fallbackSessionTombstoneLimit?: number;
 }
 
 export interface FallbackRunParams {
@@ -116,10 +145,12 @@ export interface FallbackRunParams {
   failedModel: string;
   /** The classification reason/code for attempt 1's failure (used in the terminal error / attempts log). */
   failureReason: string;
+  /** Correlates fallback-owned child aborts with the original task call. */
+  callID?: string;
 }
 
 export interface FallbackEngine {
-  /** Session ids created by this engine — shared re-entrancy guard for before/after hooks. */
+  /** Active child IDs plus bounded retired tombstones shared by before/after hooks. */
   fallbackSessionIDs: Set<string>;
   run: (params: FallbackRunParams) => Promise<FallbackResult>;
 }
@@ -214,10 +245,192 @@ function formatExhausted(base: string, attempts: readonly FallbackAttempt[]): st
   return `[model-forecast] FALLBACK EXHAUSTED: ${attempts.length} attempts failed for ${base}. Attempts: ${list}. Manual action required.`;
 }
 
+function formatCancelled(base: string): string {
+  return `[model-forecast] FALLBACK CANCELLED: child prompt cancelled for ${base}.`;
+}
+
+type BoundedOutcome<T> =
+  | { status: "resolved"; value: T }
+  | { status: "rejected"; error: unknown }
+  | { status: "timeout" };
+
+async function settleWithin<T>(
+  operation: () => Promise<T> | T,
+  timeoutMs: number,
+): Promise<BoundedOutcome<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = Promise.resolve().then(operation).then(
+    (value): BoundedOutcome<T> => ({ status: "resolved", value }),
+    (error): BoundedOutcome<T> => ({ status: "rejected", error }),
+  );
+  const deadline = new Promise<BoundedOutcome<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
+  });
+  try {
+    return await Promise.race([settled, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function isExplicitCancellation(error: unknown): boolean {
+  try {
+    if (error === null || typeof error !== "object") return false;
+    const record = error as { name?: unknown; code?: unknown };
+    return record.name === "AbortError" ||
+      record.name === "CanceledError" ||
+      record.name === "CancelledError" ||
+      record.code === "ABORT_ERR" ||
+      record.code === "ERR_CANCELED" ||
+      record.code === "ERR_CANCELLED";
+  } catch {
+    return false;
+  }
+}
+
+function sdkEnvelopeError(value: unknown): unknown | undefined {
+  try {
+    if (value === null || typeof value !== "object") return undefined;
+    const error = (value as { error?: unknown }).error;
+    return error === undefined ? undefined : error;
+  } catch {
+    return undefined;
+  }
+}
+
+type AbortRejectionCode =
+  | "abort_rejected_bad_request"
+  | "abort_rejected_not_found"
+  | "abort_rejected_cancelled"
+  | "abort_rejected_timeout"
+  | "abort_rejected_transport"
+  | "abort_rejected_unknown";
+
+function classifyAbortRejection(error: unknown): AbortRejectionCode {
+  try {
+    if (isExplicitCancellation(error)) return "abort_rejected_cancelled";
+    if (error === null || typeof error !== "object") return "abort_rejected_unknown";
+    const record = error as {
+      status?: unknown;
+      statusCode?: unknown;
+      code?: unknown;
+      error?: unknown;
+      response?: { status?: unknown };
+    };
+    const detail = record.error;
+    if (detail !== undefined && isExplicitCancellation(detail)) {
+      return "abort_rejected_cancelled";
+    }
+    const detailRecord = detail !== null && typeof detail === "object"
+      ? detail as { status?: unknown; statusCode?: unknown; code?: unknown }
+      : undefined;
+    const status = record.status ?? record.statusCode ?? detailRecord?.status ??
+      detailRecord?.statusCode ?? record.response?.status;
+    if (status === 400) return "abort_rejected_bad_request";
+    if (status === 404) return "abort_rejected_not_found";
+    const code = record.code ?? detailRecord?.code;
+    if (code === "ETIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
+      return "abort_rejected_timeout";
+    }
+    if (
+      code === "ECONNREFUSED" ||
+      code === "ECONNRESET" ||
+      code === "ENOTFOUND" ||
+      code === "EPIPE" ||
+      error instanceof TypeError
+    ) {
+      return "abort_rejected_transport";
+    }
+  } catch {
+    // Hostile error objects fall through to the closed unknown code.
+  }
+  return "abort_rejected_unknown";
+}
+
 export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const { quarantine, catalog, ladder, classify, logger } = deps;
   const maxAttempts = deps.maxAttempts;
   const fallbackSessionIDs = new Set<string>();
+  const activeFallbackSessionIDs = new Set<string>();
+  const retiredFallbackSessionIDs = new Set<string>();
+  const promptTimeoutMs = deps.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+  const abortTimeoutMs = deps.abortTimeoutMs ?? DEFAULT_ABORT_TIMEOUT_MS;
+  const configuredTombstoneLimit = deps.fallbackSessionTombstoneLimit;
+  const fallbackSessionTombstoneLimit =
+    typeof configuredTombstoneLimit === "number" && Number.isFinite(configuredTombstoneLimit)
+      ? Math.max(0, Math.floor(configuredTombstoneLimit))
+      : DEFAULT_FALLBACK_SESSION_TOMBSTONE_LIMIT;
+
+  function registerFallbackSession(sessionID: string): void {
+    retiredFallbackSessionIDs.delete(sessionID);
+    activeFallbackSessionIDs.add(sessionID);
+    fallbackSessionIDs.add(sessionID);
+  }
+
+  function retireFallbackSession(sessionID: string): void {
+    activeFallbackSessionIDs.delete(sessionID);
+    if (fallbackSessionTombstoneLimit === 0) {
+      retiredFallbackSessionIDs.delete(sessionID);
+      fallbackSessionIDs.delete(sessionID);
+      return;
+    }
+    retiredFallbackSessionIDs.delete(sessionID);
+    retiredFallbackSessionIDs.add(sessionID);
+    while (retiredFallbackSessionIDs.size > fallbackSessionTombstoneLimit) {
+      const oldest = retiredFallbackSessionIDs.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      retiredFallbackSessionIDs.delete(oldest);
+      if (!activeFallbackSessionIDs.has(oldest)) fallbackSessionIDs.delete(oldest);
+    }
+  }
+
+  function attemptInterruptionAudit(event: InterruptionAuditEvent): void {
+    const sink = deps.interruptionAudit;
+    if (sink === undefined) return;
+    try {
+      void Promise.resolve(sink(event)).catch(() => undefined);
+    } catch {
+      // Abort audit is fire-and-forget and must never delay child cleanup.
+    }
+  }
+
+  async function abortFailedPrompt(
+    sessionApi: FallbackSessionClient,
+    correlation: Omit<InterruptionAuditEvent, "event" | "error">,
+  ): Promise<void> {
+    const abort = sessionApi.abort;
+    if (typeof abort !== "function") return;
+
+    attemptInterruptionAudit({ event: "abort_requested", ...correlation });
+    const outcome = await settleWithin(
+      () => abort.call(sessionApi, { path: { id: correlation.sessionID } }),
+      abortTimeoutMs,
+    );
+
+    const resolvedError = outcome.status === "resolved"
+      ? sdkEnvelopeError(outcome.value)
+      : undefined;
+    const rejection = outcome.status === "rejected"
+      ? outcome.error
+      : outcome.status === "resolved"
+        ? outcome.value
+        : undefined;
+    if (outcome.status === "resolved" && resolvedError === undefined) {
+      attemptInterruptionAudit({ event: "abort_resolved", ...correlation });
+    } else if (outcome.status === "rejected" || resolvedError !== undefined) {
+      attemptInterruptionAudit({
+        event: "abort_rejected",
+        ...correlation,
+        error: classifyAbortRejection(rejection),
+      });
+    } else {
+      attemptInterruptionAudit({
+        event: "abort_timeout",
+        ...correlation,
+        error: "deadline_exceeded",
+      });
+    }
+  }
 
   async function run(params: FallbackRunParams): Promise<FallbackResult> {
     const attempts: FallbackAttempt[] = [{ model: params.failedModel, reason: params.failureReason }];
@@ -266,14 +479,14 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       // nested tool.execute.before/after hook firing for this sessionID
       // (because the fallback session itself dispatches a task tool call)
       // must see this session id as already-fallback-owned.
-      fallbackSessionIDs.add(sessionId);
+      registerFallbackSession(sessionId);
 
       const { providerID, modelID } = splitModelId(nextModel);
 
-      let promptResult: unknown;
+      const attemptNumber = attempts.length + 1;
       try {
-        promptResult = await Promise.resolve(
-          sessionApi!.prompt!({
+        const promptOutcome = await settleWithin(
+          () => sessionApi!.prompt!({
             path: { id: sessionId },
             body: {
               model: { providerID, modelID },
@@ -281,34 +494,74 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
               parts: [{ type: "text", text: params.prompt }],
             },
           }),
+          promptTimeoutMs,
         );
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : "prompt_failed";
-        logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
-        attempts.push({ model: nextModel, reason });
-        quarantine.add(nextModel, reason);
-        continue;
+        const promptError = promptOutcome.status === "rejected"
+          ? promptOutcome.error
+          : promptOutcome.status === "resolved"
+            ? sdkEnvelopeError(promptOutcome.value)
+            : undefined;
+        if (promptOutcome.status !== "resolved" || promptError !== undefined) {
+          if (
+            promptError !== undefined &&
+            isExplicitCancellation(promptError)
+          ) {
+            attempts.push({ model: nextModel, reason: "user_cancelled" });
+            const output = formatCancelled(params.originalSubagentType);
+            logger?.info("fallback", output);
+            return { success: false, cancelled: true, output, attempts };
+          }
+
+          const timedOut = promptOutcome.status === "timeout";
+          const reason = timedOut
+            ? "fallback_prompt_timeout"
+            : "fallback_prompt_rejected";
+          const auditReason = timedOut
+            ? "fallback_prompt_timeout"
+            : "fallback_prompt_rejected";
+          logger?.warn(
+            "fallback",
+            `session.prompt ${timedOut ? "timed out" : "rejected"} for ${nextModel}`,
+          );
+          await abortFailedPrompt(sessionApi!, {
+            sessionID: sessionId,
+            parentSessionID: params.sessionID,
+            ...(params.callID !== undefined ? { callID: params.callID } : {}),
+            attemptID: `fallback-attempt-${attemptNumber}`,
+            origin: "fallback_prompt",
+            reason: auditReason,
+          });
+          attempts.push({ model: nextModel, reason });
+          quarantine.add(nextModel, reason);
+          continue;
+        }
+        const promptResult = promptOutcome.value;
+
+        const text = joinTextParts(promptResult);
+        const classified = classify(text);
+
+        if (classified === null || classified.type === "other") {
+          // No known error pattern matched — success.
+          logger?.info("fallback", `attempt ${attempts.length + 1} succeeded on ${nextModel}`);
+          return { success: true, output: text, model: nextModel, attempts: attempts.length + 1 };
+        }
+
+        const errorType = classified.type as QuarantineErrorType;
+        const ttlMs = resolveQuarantineTtlMs({ errorType, model: nextModel });
+        quarantine.add(nextModel, classified.code, ttlMs, errorType);
+        logger?.info("fallback", `attempt ${attempts.length + 1} failed on ${nextModel} (${classified.code}); quarantined`);
+        attempts.push({ model: nextModel, reason: classified.code });
+      } finally {
+        // Active IDs are never evicted. Completed IDs become bounded
+        // tombstones so late nested hook events still short-circuit without
+        // leaking every child session for the lifetime of the plugin.
+        retireFallbackSession(sessionId);
       }
-
-      const text = joinTextParts(promptResult);
-      const classified = classify(text);
-
-      if (classified === null || classified.type === "other") {
-        // No known error pattern matched — success.
-        logger?.info("fallback", `attempt ${attempts.length + 1} succeeded on ${nextModel}`);
-        return { success: true, output: text, model: nextModel, attempts: attempts.length + 1 };
-      }
-
-      const errorType = classified.type as QuarantineErrorType;
-      const ttlMs = resolveQuarantineTtlMs({ errorType, model: nextModel });
-      quarantine.add(nextModel, classified.code, ttlMs, errorType);
-      logger?.info("fallback", `attempt ${attempts.length + 1} failed on ${nextModel} (${classified.code}); quarantined`);
-      attempts.push({ model: nextModel, reason: classified.code });
     }
 
     const output = formatExhausted(params.originalSubagentType, attempts);
     logger?.warn("fallback", output);
-    return { success: false, output, attempts };
+    return { success: false, cancelled: false, output, attempts };
   }
 
   return { fallbackSessionIDs, run };
