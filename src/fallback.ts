@@ -32,6 +32,14 @@
  * The cancelled variant of `FallbackResult` is declared for forward
  * compatibility with PR-07's cancellation handling; the engine does not
  * emit it in PR-03 because the event hook arrives in PR-05.
+ *
+ * Client shape is intentionally loose/structural (design #1623 "Client
+ * wiring" — no SDK type import). `client.session.create` /
+ * `client.session.prompt` are optional; `client.session.abort({path:{id}})`
+ * mirrors sdk.gen.d.ts:150 and is used only for failed/stalled prompts.
+ * When create or prompt is missing, the engine degrades gracefully
+ * (treats the loop as immediately exhausted
+ * after the one attempt the caller already reports) instead of throwing.
  */
 
 import type { QuarantineErrorType, QuarantineStore } from "./quarantine.js";
@@ -56,6 +64,13 @@ import {
 } from "./recovery-policy.js";
 import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
 import { providerOf } from "./model-groups.js";
+import type {
+  InterruptionAuditEvent,
+  InterruptionAuditSink,
+} from "./interruption-audit.js";
+
+const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
+const DEFAULT_FALLBACK_SESSION_TOMBSTONE_LIMIT = 256;
 
 /** A single fallback attempt record (used both mid-loop and in the terminal result). */
 export interface FallbackAttempt {
@@ -138,6 +153,15 @@ export interface FallbackEngineDeps {
    * Central coordinator that owns every recovery session lifecycle.
    */
   coordinator?: AttemptCoordinator;
+  /**
+   * Interruption audit sink for abort lifecycle events on failed/stalled
+   * fallback child prompts. Fire-and-forget; never delays cleanup.
+   */
+  interruptionAudit?: InterruptionAuditSink;
+  /** Override the deadline for session.abort (default: DEFAULT_ABORT_TIMEOUT_MS). */
+  abortTimeoutMs?: number;
+  /** Retired child IDs retained as bounded late-event tombstones. Active IDs are never evicted. */
+  fallbackSessionTombstoneLimit?: number;
 }
 
 export interface FallbackRunParams {
@@ -153,6 +177,8 @@ export interface FallbackRunParams {
   failedModel: string;
   /** The classification reason/code for attempt 1's failure (used in the terminal error / attempts log). */
   failureReason: string;
+  /** Correlates fallback-owned child aborts with the original task call. */
+  callID?: string;
 }
 
 export interface FallbackEngine {
@@ -223,7 +249,6 @@ function findNextViableModel(
   const candidates = catalog.byBase[originalSubagentType] ?? [];
   // Bucket candidates by rung AND by (provider, error-free) status so
   // we can satisfy P-03 in a single ladder walk.
-  type Bucket = { rung: LadderRung; modelIds: string[] };
   const freshByRung = new Map<LadderRung, string[]>();
   const reuseByRung = new Map<LadderRung, string[]>();
   for (const candidate of candidates) {
@@ -282,17 +307,151 @@ function reasonForOutcome(outcome: AttemptOutcome): string {
   return outcome.reason;
 }
 
+/** Loose structural type for the session API used by abortFailedPrompt. */
+interface SessionApiWithAbort {
+  abort?: (opts: { path: { id: string } }) => Promise<unknown> | unknown;
+}
+
+type BoundedOutcome<T> =
+  | { status: "resolved"; value: T }
+  | { status: "rejected"; error: unknown }
+  | { status: "timeout" };
+
+async function settleWithin<T>(
+  operation: () => Promise<T> | T,
+  timeoutMs: number,
+): Promise<BoundedOutcome<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = Promise.resolve().then(operation).then(
+    (value): BoundedOutcome<T> => ({ status: "resolved", value }),
+    (error): BoundedOutcome<T> => ({ status: "rejected", error }),
+  );
+  const deadline = new Promise<BoundedOutcome<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
+  });
+  try {
+    return await Promise.race([settled, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function sdkEnvelopeError(value: unknown): unknown | undefined {
+  try {
+    if (value === null || typeof value !== "object") return undefined;
+    const error = (value as { error?: unknown }).error;
+    return error === undefined ? undefined : error;
+  } catch {
+    return undefined;
+  }
+}
+
+type AbortRejectionCode =
+  | "abort_rejected_bad_request"
+  | "abort_rejected_not_found"
+  | "abort_rejected_cancelled"
+  | "abort_rejected_timeout"
+  | "abort_rejected_transport"
+  | "abort_rejected_unknown";
+
+function isExplicitCancellation(error: unknown): boolean {
+  try {
+    if (error === null || typeof error !== "object") return false;
+    const record = error as { name?: unknown; code?: unknown };
+    return record.name === "AbortError" ||
+      record.name === "CanceledError" ||
+      record.name === "CancelledError" ||
+      record.code === "ABORT_ERR" ||
+      record.code === "ERR_CANCELED" ||
+      record.code === "ERR_CANCELLED";
+  } catch {
+    return false;
+  }
+}
+
+function classifyAbortRejection(error: unknown): AbortRejectionCode {
+  try {
+    if (isExplicitCancellation(error)) return "abort_rejected_cancelled";
+    if (error === null || typeof error !== "object") return "abort_rejected_unknown";
+    const record = error as {
+      status?: unknown;
+      statusCode?: unknown;
+      code?: unknown;
+      error?: unknown;
+      response?: { status?: unknown };
+    };
+    const detail = record.error;
+    if (detail !== undefined && isExplicitCancellation(detail)) {
+      return "abort_rejected_cancelled";
+    }
+    const detailRecord = detail !== null && typeof detail === "object"
+      ? detail as { status?: unknown; statusCode?: unknown; code?: unknown }
+      : undefined;
+    const status = record.status ?? record.statusCode ?? detailRecord?.status ??
+      detailRecord?.statusCode ?? record.response?.status;
+    if (status === 400) return "abort_rejected_bad_request";
+    if (status === 404) return "abort_rejected_not_found";
+    const code = record.code ?? detailRecord?.code;
+    if (code === "ETIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
+      return "abort_rejected_timeout";
+    }
+    if (
+      code === "ECONNREFUSED" ||
+      code === "ECONNRESET" ||
+      code === "ENOTFOUND" ||
+      code === "EPIPE" ||
+      error instanceof TypeError
+    ) {
+      return "abort_rejected_transport";
+    }
+  } catch {
+    // Hostile error objects fall through to the closed unknown code.
+  }
+  return "abort_rejected_unknown";
+}
+
 export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const { quarantine, catalog, ladder, logger, coordinator } = deps;
   const maxAttempts = deps.maxAttempts ?? MAX_TOTAL_ATTEMPTS;
   const sessionCreateTimeoutMs = deps.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
   const sessionPromptTimeoutMs = deps.sessionPromptTimeoutMs ?? ATTEMPT_HARD_TIMEOUT_MS;
+  const abortTimeoutMs = deps.abortTimeoutMs ?? DEFAULT_ABORT_TIMEOUT_MS;
   const nowFn = deps.now ?? ((): Date => new Date());
   const attemptedProviders = new Set<string>();
   const providerHadError = new Set<string>();
 
+  // Tombstone management for re-entrancy guard (feature branch addition).
+  const configuredTombstoneLimit = deps.fallbackSessionTombstoneLimit;
+  const fallbackSessionTombstoneLimit =
+    typeof configuredTombstoneLimit === "number" && Number.isFinite(configuredTombstoneLimit)
+      ? Math.max(0, Math.floor(configuredTombstoneLimit))
+      : DEFAULT_FALLBACK_SESSION_TOMBSTONE_LIMIT;
+  const activeFallbackSessionIDs = new Set<string>();
+  const retiredFallbackSessionIDs = new Set<string>();
+
+  function registerFallbackSession(sessionID: string): void {
+    retiredFallbackSessionIDs.delete(sessionID);
+    activeFallbackSessionIDs.add(sessionID);
+  }
+
+  function retireFallbackSession(sessionID: string): void {
+    activeFallbackSessionIDs.delete(sessionID);
+    if (fallbackSessionTombstoneLimit === 0) {
+      retiredFallbackSessionIDs.delete(sessionID);
+      return;
+    }
+    retiredFallbackSessionIDs.delete(sessionID);
+    retiredFallbackSessionIDs.add(sessionID);
+    while (retiredFallbackSessionIDs.size > fallbackSessionTombstoneLimit) {
+      const oldest = retiredFallbackSessionIDs.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      retiredFallbackSessionIDs.delete(oldest);
+    }
+  }
+
   function markInternal(sessionId: string, taskCallID: string | undefined): void {
     if (coordinator === undefined) return;
+    // When coordinator is available, use it as the canonical registry.
     try {
       coordinator.markInternalSession(sessionId, taskCallID);
     } catch (err) {
@@ -301,10 +460,15 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         `coordinator.markInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    // Also track locally for tombstone-based re-entrancy.
+    registerFallbackSession(sessionId);
   }
 
   function unmarkInternal(sessionId: string): void {
-    if (coordinator === undefined) return;
+    if (coordinator === undefined) {
+      retireFallbackSession(sessionId);
+      return;
+    }
     try {
       coordinator.unmarkInternalSession(sessionId);
     } catch (err) {
@@ -312,6 +476,55 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
         "fallback",
         `coordinator.unmarkInternalSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+    retireFallbackSession(sessionId);
+  }
+
+  function attemptInterruptionAudit(event: InterruptionAuditEvent): void {
+    const sink = deps.interruptionAudit;
+    if (sink === undefined) return;
+    try {
+      void Promise.resolve(sink(event)).catch(() => undefined);
+    } catch {
+      // Abort audit is fire-and-forget and must never delay child cleanup.
+    }
+  }
+
+  async function abortFailedPrompt(
+    sessionApi: SessionApiWithAbort,
+    correlation: Omit<InterruptionAuditEvent, "event" | "error">,
+  ): Promise<void> {
+    const abort = sessionApi.abort;
+    if (typeof abort !== "function") return;
+
+    attemptInterruptionAudit({ event: "abort_requested", ...correlation });
+    const outcome = await settleWithin(
+      () => abort.call(sessionApi, { path: { id: correlation.sessionID } }),
+      abortTimeoutMs,
+    );
+
+    const resolvedError = outcome.status === "resolved"
+      ? sdkEnvelopeError(outcome.value)
+      : undefined;
+    const rejection = outcome.status === "rejected"
+      ? outcome.error
+      : outcome.status === "resolved"
+        ? outcome.value
+        : undefined;
+    if (outcome.status === "resolved" && resolvedError === undefined) {
+      attemptInterruptionAudit({ event: "abort_resolved", ...correlation });
+    } else if (outcome.status === "rejected" || resolvedError !== undefined) {
+      attemptInterruptionAudit({
+        event: "abort_rejected",
+        ...correlation,
+        error: classifyAbortRejection(rejection),
+      });
+    } else {
+      attemptInterruptionAudit({
+        event: "abort_timeout",
+        ...correlation,
+        error: "deadline_exceeded",
+      });
     }
   }
 
@@ -450,6 +663,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
 
       const { providerID, modelID } = splitModelId(nextModel);
 
+      const attemptNumber = attempts.length + 1;
       let promptResult: unknown;
       try {
         promptResult = await withDeadline(
@@ -481,7 +695,15 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
             logger,
           });
         } else if (timedOut && typeof sessionApi!.abort === "function") {
-          void Promise.resolve(sessionApi!.abort!({ path: { id: sessionId } })).catch(() => {});
+          // Use abortFailedPrompt for audit tracking when interruption sink is wired.
+          void abortFailedPrompt(sessionApi! as SessionApiWithAbort, {
+            sessionID: sessionId,
+            parentSessionID: params.sessionID,
+            ...(params.callID !== undefined ? { callID: params.callID } : {}),
+            attemptID: `fallback-attempt-${attemptNumber}`,
+            origin: "fallback_prompt",
+            reason: "fallback_prompt_timeout",
+          });
         }
         logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
         attempts.push({

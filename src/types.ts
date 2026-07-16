@@ -358,6 +358,12 @@ export interface SelectionAuditEntry {
    * `"selection"` for forward-compat consumers.
    */
   kind?: "selection";
+  /**
+   * Machine-readable reason a proposed switch was refused at the final
+   * dispatch-authorization boundary. Optional for backward compatibility
+   * with selection audit entries written before live authorization existed.
+   */
+  refusalCause?: SelectionRefusalCause;
 }
 
 export type RecoveryAuditEvent =
@@ -384,6 +390,11 @@ export interface RecoveryAuditEntry {
   message?: string;
 }
 
+export type SelectionRefusalCause =
+  | "candidate_quarantined"
+  | "live_snapshot_unavailable"
+  | "candidate_not_live";
+
 /**
  * Discriminated audit-entry union. Consumers narrow with
  * `entry.kind === "quarantine"`; the selection variant is the default.
@@ -403,4 +414,47 @@ export interface HooksConfig {
   denylist: string[];
   projectPolicyPath?: string;
   userPolicyPath?: string;
+}
+
+/* -------------------------------------------------------------------------- *
+ * Task 1 — session-scoped live availability state.
+ *
+ * Updated per config-hook invocation from that invocation's single,
+ * bound, timeout-protected `client.provider.list()` call. The latest
+ * invocation wins. The state becomes `ready: true` (with a
+ * case-preserving `Set<provider/model>`) ONLY after a successful live
+ * parse; every other path leaves the state `ready: false` with a short
+ * `reason` string.
+ *
+ * Cached model data (gentle-ai / OpenCode models cache) does NOT make
+ * the state ready — only a live SDK call counts. The config hook may
+ * still use the cache as a profile-catalog fallback while the state
+ * stays unavailable.
+ *
+ * Task 1 establishes this surface; Task 2 will gate the final rewrite
+ * on `state.ready`.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Session-scoped snapshot of live model availability. The `models` set
+ * is intentionally CASE-PRESERVING — it records `provider/model` exactly
+ * as the live SDK returned them (no `toLowerCase` projection), so
+ * downstream matching can stay defensive about casing.
+ */
+export interface LiveAvailabilityState {
+  /** True iff the state was captured from a successful live provider.list(). */
+  readonly ready: boolean;
+  /** Case-preserving `Set<provider/model>` of available models. Empty when not ready. */
+  readonly models: ReadonlySet<string>;
+  /** Short reason describing why the state is unavailable. Empty when ready. */
+  readonly reason: string;
+  /**
+   * Source identifier — narrowed to the two values the spec actually
+   * produces. `"provider-list"` is the only path that flips the state
+   * to `ready` (the live, bound, timeout-protected `client.provider.list()`
+   * call from the config hook). `"none"` covers every other path
+   * (config hook not yet called, missing client / provider / list,
+   * sync throw, rejected promise, timeout, malformed / empty result).
+   */
+  readonly source: "provider-list" | "none";
 }
