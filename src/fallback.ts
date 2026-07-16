@@ -681,7 +681,25 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       } catch (err) {
         const finishedAt = nowMs(nowFn);
         const timedOut = err instanceof DeadlineError;
+        const explicitCancel = isExplicitCancellation(err);
+        // Explicit user cancellation (AbortError / CancelledError /
+        // ABORT_ERR / ERR_CANCELLED) is TERMINAL — never retry, never
+        // quarantine, never mark exhausted. Just return immediately so
+        // the after-hook surfaces the cancellation to the caller.
+        if (explicitCancel) {
+          logger?.info(
+            "fallback",
+            `session.prompt cancelled for ${nextModel} (${err instanceof Error ? err.name : "unknown"}); returning cancelled`,
+          );
+          unmarkInternal(sessionId);
+          return { status: "cancelled", reason: "user_cancelled", attempts };
+        }
         const reason = timedOut ? "hard_timeout" : err instanceof Error ? err.message : "session_prompt_failed";
+        // Audit+abort the failed fallback child prompt. When the prompt
+        // failed (timeout OR transport rejection) we want one observable
+        // abort lifecycle emitted — even when the next iteration of the
+        // fallback loop will simply retry on a different model. The audit
+        // sink is best-effort and never blocks the retry.
         if (timedOut && coordinator !== undefined && params.taskCallID !== undefined) {
           const task = coordinator.tasksByCallID.get(params.taskCallID);
           void safeAbortSession({
@@ -694,15 +712,17 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
             reason: "hard_timeout",
             logger,
           });
-        } else if (timedOut && typeof sessionApi!.abort === "function") {
-          // Use abortFailedPrompt for audit tracking when interruption sink is wired.
+        } else if (typeof sessionApi!.abort === "function") {
+          // Always emit an audit-tracked abort for failed fallback
+          // prompts (timeout OR transport rejection). The audit reason
+          // disambiguates the two cases.
           void abortFailedPrompt(sessionApi! as SessionApiWithAbort, {
             sessionID: sessionId,
             parentSessionID: params.sessionID,
             ...(params.callID !== undefined ? { callID: params.callID } : {}),
             attemptID: `fallback-attempt-${attemptNumber}`,
             origin: "fallback_prompt",
-            reason: "fallback_prompt_timeout",
+            reason: timedOut ? "fallback_prompt_timeout" : "fallback_prompt_rejected",
           });
         }
         logger?.warn("fallback", `session.prompt threw for ${nextModel}: ${reason}`);
@@ -725,6 +745,23 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
 
       const outcome = classifySdkResult(promptResult);
       const finishedAt = nowMs(nowFn);
+
+      // Resolved SDK error envelopes can carry an AbortError / cancellation
+      // marker (e.g. `{ data: undefined, error: <AbortError> }`). When the
+      // SDK surfaces this as a resolved value rather than a thrown
+      // rejection, we still want the same terminal cancellation as the
+      // thrown case — no retry, no quarantine, no abort, no exhausted.
+      if (outcome.kind === "failure") {
+        const envelopeError = sdkEnvelopeError(promptResult);
+        if (isExplicitCancellation(envelopeError)) {
+          logger?.info(
+            "fallback",
+            `session.prompt resolved with cancellation envelope for ${nextModel}; returning cancelled`,
+          );
+          unmarkInternal(sessionId);
+          return { status: "cancelled", reason: "user_cancelled", attempts };
+        }
+      }
 
       if (outcome.kind === "success") {
         logger?.info(

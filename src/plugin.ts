@@ -1162,9 +1162,15 @@ const invocation = ++latestConfigInvocation;
       // ENTIRE body so profile generation is strictly best-effort and can
       // never break config resolution.
       try {
-        // Only clear TTL-based quarantines (rate limits); permanent quarantines
-        // (provider/billing errors) persist across plugin restarts.
-        quarantine.clearNonPermanent();
+        // Only clear TTL-based quarantines (rate limits) on the FIRST
+        // config-hook invocation. Subsequent invocations are part of the
+        // same live session and must preserve any rate-limit quarantine
+        // added by the after hook between calls — otherwise a single
+        // 429 → quarantine → next configHook → cleared → re-rewritten
+        // loop would break the gate.
+        if (invocation === 1) {
+          quarantine.clearNonPermanent();
+        }
         if (options?.generatedProfiles?.enabled === false) {
           setLiveAvailability(
             invocation,

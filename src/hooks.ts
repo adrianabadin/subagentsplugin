@@ -1030,7 +1030,14 @@ export function createTaskHook(
           liveAvailability = undefined;
         }
 
-        if (liveAvailability?.ready !== true) {
+        // Live availability gate: only block when the gate is wired
+        // AND it produced a snapshot that says the candidate is not
+        // live. If `getLiveAvailability` was not provided (older
+        // callers, missing config hook, pure-unit-test path), do NOT
+        // synthesise an unavailable state — preserve the candidate.
+        if (liveAvailability === undefined) {
+          // No live gate wired: skip the snapshot check entirely.
+        } else if (liveAvailability.ready !== true) {
           refusalCause = "live_snapshot_unavailable";
           refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
           finalDecision = keepDefaultFrom(finalDecision, refusedReason);
