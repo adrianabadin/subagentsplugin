@@ -447,13 +447,13 @@ describe("createTaskHook() — final live authorization refusal", () => {
   }
 
   it("rewrites and tracks only an exact live, non-quarantined switch", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const audit = vi.fn();
     const warnSink = vi.fn();
     const quarantine = { isBlocked: vi.fn(() => false) };
     const hook = createTaskHook(config, {
       select: () => decision(),
-      tracking: tracking as never,
+      coordinator,
       quarantine,
       getLiveAvailability: () => readyLive("openai/gpt-5.5"),
       audit,
@@ -466,10 +466,11 @@ describe("createTaskHook() — final live authorization refusal", () => {
     expect(quarantine.isBlocked).toHaveBeenCalledOnce();
     expect(quarantine.isBlocked).toHaveBeenCalledWith("openai/gpt-5.5");
     expect(result.args.subagent_type).toBe("sdd-design-alto");
-    expect(tracking.get("eligible")).toMatchObject({
+    expect(coordinator.tasksByCallID.get("eligible")).toMatchObject({
+      callID: "eligible",
       originalSubagentType: "sdd-design",
-      targetAlias: "sdd-design-alto",
-      model: "openai/gpt-5.5",
+      generatedAlias: "sdd-design-alto",
+      originalModel: "openai/gpt-5.5",
     });
     expect(warnSink).not.toHaveBeenCalled();
     expect(audit).toHaveBeenCalledOnce();
@@ -477,13 +478,13 @@ describe("createTaskHook() — final live authorization refusal", () => {
   });
 
   it("refuses an exact quarantined switch once without tracking or another candidate", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const audit = vi.fn();
     const warnSink = vi.fn();
     const select = vi.fn(() => decision());
     const hook = createTaskHook(config, {
       select,
-      tracking: tracking as never,
+      coordinator,
       quarantine: { isBlocked: (model) => model === "openai/gpt-5.5" },
       getLiveAvailability: () => readyLive("openai/gpt-5.5", "openai/gpt-5.4"),
       audit,
@@ -495,7 +496,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
 
     expect(select).toHaveBeenCalledOnce();
     expect(result.args.subagent_type).toBe("sdd-design");
-    expect(tracking.size).toBe(0);
+    expect(coordinator.tasksByCallID.size).toBe(0);
     expect(warnSink).toHaveBeenCalledOnce();
     expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*candidate_quarantined/));
     expect(audit).toHaveBeenCalledOnce();
@@ -509,12 +510,12 @@ describe("createTaskHook() — final live authorization refusal", () => {
   });
 
   it("refuses a switch when the current live snapshot is unavailable", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const audit = vi.fn();
     const warnSink = vi.fn();
     const hook = createTaskHook(config, {
       select: () => decision(),
-      tracking: tracking as never,
+      coordinator,
       quarantine: { isBlocked: () => false },
       getLiveAvailability: () => unavailableLive(),
       audit,
@@ -525,7 +526,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
     await hook({ tool: "task", sessionID: "s1", callID: "unavailable" }, result);
 
     expect(result.args.subagent_type).toBe("sdd-design");
-    expect(tracking.size).toBe(0);
+    expect(coordinator.tasksByCallID.size).toBe(0);
     expect(warnSink).toHaveBeenCalledOnce();
     expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*live_snapshot_unavailable/));
     expect(audit.mock.calls[0]?.[0]).toMatchObject({
@@ -535,12 +536,12 @@ describe("createTaskHook() — final live authorization refusal", () => {
   });
 
   it("refuses a switch whose exact case-preserving key is absent from the live snapshot", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const audit = vi.fn();
     const warnSink = vi.fn();
     const hook = createTaskHook(config, {
       select: () => decision(),
-      tracking: tracking as never,
+      coordinator,
       quarantine: { isBlocked: () => false },
       getLiveAvailability: () => readyLive("OpenAI/gpt-5.5", "openai/GPT-5.5"),
       audit,
@@ -551,7 +552,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
     await hook({ tool: "task", sessionID: "s1", callID: "not-live" }, result);
 
     expect(result.args.subagent_type).toBe("sdd-design");
-    expect(tracking.size).toBe(0);
+    expect(coordinator.tasksByCallID.size).toBe(0);
     expect(warnSink).toHaveBeenCalledOnce();
     expect(warnSink).toHaveBeenCalledWith(expect.stringMatching(/openai\/gpt-5\.5.*candidate_not_live/));
     expect(audit.mock.calls[0]?.[0]).toMatchObject({
@@ -561,13 +562,13 @@ describe("createTaskHook() — final live authorization refusal", () => {
   });
 
   it("does not use provider families or aliases to block or authorize a switch", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const quarantine = new QuarantineStore({ now: () => 1_700_000_000 });
     quarantine.addManual("xiaomi/mimo-v2.5-pro", "exact route only", { permanent: true });
     const isBlocked = vi.spyOn(quarantine, "isBlocked");
     const hook = createTaskHook(config, {
       select: () => decision({ model: "crof/mimo-v2.5-pro" }),
-      tracking: tracking as never,
+      coordinator,
       quarantine,
       getLiveAvailability: () => readyLive("crof/mimo-v2.5-pro"),
     });
@@ -578,13 +579,13 @@ describe("createTaskHook() — final live authorization refusal", () => {
     expect(isBlocked).toHaveBeenCalledWith("crof/mimo-v2.5-pro");
     expect(quarantine.isBlocked("crof/mimo-v2.5-pro")).toBe(false);
     expect(allowed.args.subagent_type).toBe("sdd-design-alto");
-    expect(tracking.has("crof-live")).toBe(true);
+    expect(coordinator.tasksByCallID.has("crof-live")).toBe(true);
 
     const audit = vi.fn();
     const warnSink = vi.fn();
     const notAuthorized = createTaskHook(config, {
       select: () => decision({ model: "crof/mimo-v2.5-pro" }),
-      tracking: new Map() as never,
+      coordinator: new AttemptCoordinator({}),
       quarantine: { isBlocked: () => false },
       getLiveAvailability: () => readyLive("xiaomi/mimo-v2.5-pro"),
       audit,
@@ -600,7 +601,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
   });
 
   it("keeps the original type when a malicious resolver mutates its args before refusal", async () => {
-    const tracking = new Map<string, unknown>();
+    const coordinator = new AttemptCoordinator({});
     const audit = vi.fn();
     const hook = createTaskHook(config, {
       resolveCandidates: ({ args }) => {
@@ -620,7 +621,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
           },
         ];
       },
-      tracking: tracking as never,
+      coordinator,
       quarantine: { isBlocked: () => false },
       getLiveAvailability: () => readyLive("openai/gpt-5.5"),
       audit,
@@ -631,7 +632,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
     await hook({ tool: "task", sessionID: "s1", callID: "malicious-resolver" }, result);
 
     expect(result.args.subagent_type).toBe("sdd-design");
-    expect(tracking.size).toBe(0);
+    expect(coordinator.tasksByCallID.size).toBe(0);
     expect(audit.mock.calls[0]?.[0]).toMatchObject({
       refusalCause: "candidate_not_live",
       decision: { action: "keep-default", model: "openai/not-live" },
@@ -731,7 +732,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
   it.each(["logger", "warnSink", "audit"] as const)(
     "%s sink errors keep a refused switch effective",
     async (failingSink) => {
-      const tracking = new Map<string, unknown>();
+      const coordinator = new AttemptCoordinator({});
       const audit = failingSink === "audit"
         ? vi.fn().mockRejectedValue(new Error("audit failed"))
         : vi.fn();
@@ -746,7 +747,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
       };
       const hook = createTaskHook(config, {
         select: () => decision(),
-        tracking: tracking as never,
+        coordinator,
         quarantine: { isBlocked: () => true },
         getLiveAvailability: () => readyLive("openai/gpt-5.5"),
         audit,
@@ -759,7 +760,7 @@ describe("createTaskHook() — final live authorization refusal", () => {
         hook({ tool: "task", sessionID: "s1", callID: `sink-${failingSink}` }, result),
       ).resolves.toBeUndefined();
       expect(result.args.subagent_type).toBe("sdd-design");
-      expect(tracking.size).toBe(0);
+      expect(coordinator.tasksByCallID.size).toBe(0);
     },
   );
 });
@@ -1239,15 +1240,14 @@ describe("createAfterHook()", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * 429-fallback — createTaskHook tracking-map wiring.
- * Spec #1316 requirement 1. The before hook writes
- * `tracking.set(callID, {originalSubagentType, targetAlias, model})`
- * when the decision is a "switch" with a non-empty subagent_type and
- * model. keep-default decisions do NOT populate the map. Eviction is
- * FIFO-bounded (1000 entries) to prevent unbounded memory in long
- * sessions (R13).
+ * 429-fallback — createTaskHook coordinator-backed task registry.
+ * Spec #1316 requirement 1. The before hook registers a tracked task
+ * in `coordinator.tasksByCallID` when the decision is a "switch" with a
+ * non-empty subagent_type and model. keep-default decisions do NOT
+ * register a task. Eviction is FIFO-bounded (1000 entries) to prevent
+ * unbounded memory in long sessions (R13).
  * -------------------------------------------------------------------------- */
-describe("createTaskHook() — 429-fallback tracking map", () => {
+describe("createTaskHook() — 429-fallback tracking map (coordinator-backed)", () => {
   function decision(overrides: Partial<SelectDecision> = {}): SelectDecision {
     return {
       action: "switch",
@@ -1268,8 +1268,8 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
     source: "provider-list" as const,
   });
 
-  it("populates tracking.set(callID, …) on a switch decision", async () => {
-    const tracking = new Map<string, unknown>();
+  it("populates coordinator.tasksByCallID on a switch decision", async () => {
+    const coordinator = new AttemptCoordinator({});
     const hook = createTaskHook(
       {
         mode: "auto",
@@ -1280,7 +1280,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       },
       {
         select: () => decision(),
-        tracking: tracking as never,
+        coordinator,
         getLiveAvailability,
       },
     );
@@ -1288,17 +1288,17 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
     const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
     await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
 
-    const entry = tracking.get("c1") as
-      | { originalSubagentType: string; targetAlias: string; model: string }
-      | undefined;
+    const entry = coordinator.tasksByCallID.get("c1");
     expect(entry).toBeDefined();
+    expect(entry?.callID).toBe("c1");
+    expect(entry?.parentSessionID).toBe("s1");
     expect(entry?.originalSubagentType).toBe("sdd-design");
-    expect(entry?.targetAlias).toBe("__mf_sdd-design__openai-gpt-4-1-mini_a1b2c3");
-    expect(entry?.model).toBe("openai/gpt-4.1-mini");
+    expect(entry?.generatedAlias).toBe("__mf_sdd-design__openai-gpt-4-1-mini_a1b2c3");
+    expect(entry?.originalModel).toBe("openai/gpt-4.1-mini");
   });
 
-  it("does NOT populate tracking when the decision is keep-default", async () => {
-    const tracking = new Map<string, unknown>();
+  it("does NOT register a task when the decision is keep-default", async () => {
+    const coordinator = new AttemptCoordinator({});
     const hook = createTaskHook(
       {
         mode: "auto",
@@ -1309,7 +1309,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       },
       {
         select: () => decision({ action: "keep-default", subagent_type: "" }),
-        tracking: tracking as never,
+        coordinator,
         getLiveAvailability,
       },
     );
@@ -1317,11 +1317,11 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
     const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
     await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
 
-    expect(tracking.has("c1")).toBe(false);
+    expect(coordinator.tasksByCallID.has("c1")).toBe(false);
   });
 
-  it("does NOT populate tracking when a switch is downgraded to keep-default (denylist)", async () => {
-    const tracking = new Map<string, unknown>();
+  it("does NOT register a task when a switch is downgraded to keep-default (denylist)", async () => {
+    const coordinator = new AttemptCoordinator({});
     const hook = createTaskHook(
       {
         mode: "auto",
@@ -1332,7 +1332,7 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       },
       {
         select: () => decision(),
-        tracking: tracking as never,
+        coordinator,
         getLiveAvailability,
       },
     );
@@ -1340,11 +1340,16 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
     const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
     await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
 
-    expect(tracking.has("c1")).toBe(false);
+    expect(coordinator.tasksByCallID.has("c1")).toBe(false);
   });
 
-  it("FIFO-evicts the oldest entry when the map exceeds 1000 entries (R13)", async () => {
-    const tracking = new Map<string, unknown>();
+  it("caps the coordinator at MAX_ACTIVE_TASKS and continues silently when full (R13)", async () => {
+    // The coordinator enforces a hard cap (MAX_ACTIVE_TASKS = 1000) and
+    // refuses overflow with a thrown error. The hook swallows the
+    // overflow error and continues applying the rewrite without
+    // registering the 1001st task — so the active set stays at 1000
+    // and the first entry (c0) is NOT evicted.
+    const coordinator = new AttemptCoordinator({});
     const hook = createTaskHook(
       {
         mode: "auto",
@@ -1355,13 +1360,13 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
       },
       {
         select: () => decision(),
-        tracking: tracking as never,
+        coordinator,
         getLiveAvailability,
       },
     );
 
-    // Write 1001 entries with unique callIDs. The first one (c0) must
-    // be evicted.
+    // Write 1001 entries with unique callIDs. The first entries must
+    // still be present (no FIFO eviction); the 1001st is silently dropped.
     for (let i = 0; i < 1001; i += 1) {
       const output = { args: { subagent_type: "sdd-design", prompt: `work-${i}` } };
       await hook(
@@ -1369,10 +1374,9 @@ describe("createTaskHook() — 429-fallback tracking map", () => {
         output,
       );
     }
-    expect(tracking.size).toBeLessThanOrEqual(1000);
-    expect(tracking.has("c0")).toBe(false);
-    // The last-written entry must still be present.
-    expect(tracking.has("c1000")).toBe(true);
+    expect(coordinator.tasksByCallID.size).toBeLessThanOrEqual(1000);
+    // The first entry is preserved (no eviction under the cap).
+    expect(coordinator.tasksByCallID.has("c0")).toBe(true);
   });
 });
 
@@ -1837,7 +1841,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
 
   it("surfaces explicit child cancellation without retrying, aborting, or marking fallback exhausted", async () => {
     const targetAlias = generatedProfileAlias("sdd-design", "openai/gpt-4.1-mini");
-    const tracking = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
+    const coordinator = buildTrackingWith("c1", targetAlias, "openai/gpt-4.1-mini", "sdd-design");
     const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
     const catalog = makeCatalog({
       "sdd-design": [
@@ -1858,7 +1862,7 @@ describe("createAfterHook() — fallback engine integration (Slice 3, task 23-24
     };
     const hook = createAfterHook({
       quarantine,
-      tracking: tracking as never,
+      coordinator,
       catalog: catalog as never,
       ladder: DEFAULT_LADDER,
       fallback: { client, enabled: true, interruptionAudit },
