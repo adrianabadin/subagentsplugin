@@ -18,6 +18,7 @@ import { createFallbackEngine, type FallbackCatalogSlice, type FallbackClient } 
 import { QuarantineStore } from "../src/quarantine.js";
 import { classifyError } from "../src/error-classification.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
+import { AttemptCoordinator } from "../src/attempt-coordinator.js";
 
 function makeCatalog(byBase: Record<string, Array<{ modelId: string }>>): FallbackCatalogSlice {
   return {
@@ -557,5 +558,282 @@ describe("createFallbackEngine()", () => {
     });
 
     await expect(engine.run({ sessionID: "parent", originalSubagentType: "sdd-design", prompt: "work", failedModel: "unqualified", failureReason: "rate_limit" })).resolves.toMatchObject({ status: "success", model: "minimax/M3" });
+  });
+});
+
+/**
+ * Design v4 — Fallback dispatch live membership (contract D).
+ *
+ * Immediately before every real session.prompt({model}), the engine must
+ * require exact live membership + quarantine. A disconnected candidate is
+ * SKIPPED and the next ranked fallback is tried. When live is unavailable,
+ * the engine dispatches NONE and preserves the current safe result.
+ */
+describe("createFallbackEngine() — Design v4 live membership gate (D)", () => {
+  function successClient() {
+    const prompted: Array<{ providerID: string; modelID: string }> = [];
+    const client: FallbackClient = {
+      session: {
+        create: vi.fn(async () => ({ id: "child" })),
+        prompt: vi.fn(async (opts: {
+          body: { model?: { providerID: string; modelID: string } };
+        }) => {
+          prompted.push({
+            providerID: opts.body.model?.providerID ?? "",
+            modelID: opts.body.model?.modelID ?? "",
+          });
+          return { parts: [{ type: "text", text: "recovered" }] };
+        }),
+      },
+    };
+    return { client, prompted };
+  }
+
+  it("skips a disconnected candidate and dispatches the next connected one", async () => {
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({
+      "sdd-design": [
+        { modelId: "openai/gpt-4.1-mini" },
+        { modelId: "minimax/M3" },
+        { modelId: "anthropic/claude-opus-4-7" },
+      ],
+    });
+    const { client, prompted } = successClient();
+
+    const engine = createFallbackEngine({
+      client,
+      quarantine,
+      catalog,
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 3,
+      resolveLive: async () => ({
+        status: "ready",
+        // minimax/M3 is DISCONNECTED; only claude is live.
+        models: ["anthropic/claude-opus-4-7"],
+      }),
+    });
+
+    const result = await engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/gpt-4.1-mini",
+      failureReason: "HTTP 429",
+    });
+
+    expect(result.status).toBe("success");
+    if (result.status === "success") {
+      expect(result.model).toBe("anthropic/claude-opus-4-7");
+    }
+    // The disconnected minimax/M3 was NEVER prompted.
+    expect(prompted).toHaveLength(1);
+    expect(prompted[0]?.providerID).toBe("anthropic");
+    expect(prompted[0]?.modelID).toBe("claude-opus-4-7");
+  });
+
+  it("when live is unavailable, dispatches NO prompt and preserves the safe (exhausted) result", async () => {
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({
+      "sdd-design": [
+        { modelId: "openai/gpt-4.1-mini" },
+        { modelId: "minimax/M3" },
+      ],
+    });
+    const { client, prompted } = successClient();
+
+    const engine = createFallbackEngine({
+      client,
+      quarantine,
+      catalog,
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 3,
+      resolveLive: async () => ({ status: "unavailable", models: [] }),
+    });
+
+    const result = await engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/gpt-4.1-mini",
+      failureReason: "HTTP 429",
+    });
+
+    // No prompt dispatched; engine terminates with the safe exhausted result.
+    expect(prompted).toHaveLength(0);
+    expect(result.status).toBe("exhausted");
+    if (result.status === "exhausted") {
+      expect(result.output.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("when no injected resolver is present, legacy dispatch behavior is preserved", async () => {
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const catalog = makeCatalog({
+      "sdd-design": [
+        { modelId: "openai/gpt-4.1-mini" },
+        { modelId: "minimax/M3" },
+      ],
+    });
+    const { client, prompted } = successClient();
+
+    const engine = createFallbackEngine({
+      client,
+      quarantine,
+      catalog,
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 3,
+      // No resolveLive — legacy behavior: no live gate before prompt.
+    });
+
+    const result = await engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/gpt-4.1-mini",
+      failureReason: "HTTP 429",
+    });
+
+    expect(result.status).toBe("success");
+    expect(prompted[0]?.modelID).toBe("M3");
+  });
+
+  it("rechecks quarantine immediately before prompt and skips a candidate blocked during session creation", async () => {
+    const quarantine = new QuarantineStore({ ttlMs: 3_600_000, now: () => 1_700_000_000 });
+    const prompted: string[] = [];
+    let creates = 0;
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn(async () => {
+            creates += 1;
+            if (creates === 1) quarantine.add("minimax/M3", "blocked-during-create");
+            return { id: `child-${creates}` };
+          }),
+          prompt: vi.fn(async (opts: { body: { model?: { providerID: string; modelID: string } } }) => {
+            prompted.push(`${opts.body.model?.providerID}/${opts.body.model?.modelID}`);
+            return { parts: [{ type: "text", text: "recovered" }] };
+          }),
+        },
+      },
+      quarantine,
+      catalog: makeCatalog({
+        "sdd-design": [
+          { modelId: "openai/gpt-4.1-mini" },
+          { modelId: "minimax/M3" },
+          { modelId: "anthropic/claude-opus-4-7" },
+        ],
+      }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 3,
+      resolveLive: async () => ({
+        status: "ready",
+        models: ["minimax/M3", "anthropic/claude-opus-4-7"],
+      }),
+    });
+
+    await expect(engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/gpt-4.1-mini",
+      failureReason: "HTTP 429",
+    })).resolves.toMatchObject({ status: "success", model: "anthropic/claude-opus-4-7" });
+    expect(prompted).toEqual(["anthropic/claude-opus-4-7"]);
+  });
+
+  it("aborts and unmarks a created child when live availability becomes unavailable before prompt", async () => {
+    const coordinator = new AttemptCoordinator();
+    const abort = vi.fn(async () => true);
+    const prompt = vi.fn(async () => ({ parts: [{ type: "text", text: "unexpected" }] }));
+    let liveCalls = 0;
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn(async () => ({ id: "child-unavailable" })),
+          prompt,
+          abort,
+        },
+      },
+      quarantine: new QuarantineStore({ ttlMs: 3_600_000 }),
+      catalog: makeCatalog({
+        "sdd-design": [
+          { modelId: "openai/failed" },
+          { modelId: "minimax/M3" },
+        ],
+      }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 2,
+      coordinator,
+      resolveLive: async () => {
+        liveCalls += 1;
+        return liveCalls === 1
+          ? { status: "ready", models: ["minimax/M3"] }
+          : { status: "unavailable" };
+      },
+    });
+
+    await expect(engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/failed",
+      failureReason: "HTTP 429",
+    })).resolves.toMatchObject({ status: "exhausted" });
+    expect(prompt).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith({ path: { id: "child-unavailable" } });
+    expect(coordinator.internalSessionIDs.has("child-unavailable")).toBe(false);
+  });
+
+  it("aborts and unmarks a child that disconnects before prompt, then tries the next live candidate", async () => {
+    const coordinator = new AttemptCoordinator();
+    const abort = vi.fn(async () => true);
+    const prompt = vi.fn(async () => ({ parts: [{ type: "text", text: "recovered" }] }));
+    let liveCalls = 0;
+    const engine = createFallbackEngine({
+      client: {
+        session: {
+          create: vi.fn()
+            .mockResolvedValueOnce({ id: "child-disconnected" })
+            .mockResolvedValueOnce({ id: "child-connected" }),
+          prompt,
+          abort,
+        },
+      },
+      quarantine: new QuarantineStore({ ttlMs: 3_600_000 }),
+      catalog: makeCatalog({
+        "sdd-design": [
+          { modelId: "openai/failed" },
+          { modelId: "minimax/M3" },
+          { modelId: "anthropic/claude-opus-4-7" },
+        ],
+      }),
+      ladder: DEFAULT_LADDER,
+      classify: classifyError,
+      maxAttempts: 3,
+      coordinator,
+      resolveLive: async () => {
+        liveCalls += 1;
+        if (liveCalls === 1) {
+          return { status: "ready", models: ["minimax/M3", "anthropic/claude-opus-4-7"] };
+        }
+        return { status: "ready", models: ["anthropic/claude-opus-4-7"] };
+      },
+    });
+
+    await expect(engine.run({
+      sessionID: "parent",
+      originalSubagentType: "sdd-design",
+      prompt: "work",
+      failedModel: "openai/failed",
+      failureReason: "HTTP 429",
+    })).resolves.toMatchObject({ status: "success", model: "anthropic/claude-opus-4-7" });
+    expect(abort).toHaveBeenCalledWith({ path: { id: "child-disconnected" } });
+    expect(coordinator.internalSessionIDs.has("child-disconnected")).toBe(false);
+    expect(prompt).toHaveBeenCalledOnce();
   });
 });

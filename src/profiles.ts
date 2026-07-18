@@ -39,6 +39,8 @@ export interface GeneratedProfileCatalog {
 export interface GenerateProfilesOptions {
   phasePrefixes?: string[];
   maxProfilesPerBase?: number;
+  /** Exact aliases owned by this plugin instance. Mutated only at commit. */
+  ownedAliases?: Set<string>;
 }
 
 const DEFAULT_PHASE_PREFIXES = ["sdd-"] as const;
@@ -77,8 +79,10 @@ export function generatedProfileAlias(baseAgent: string, modelId: string): strin
   return `${GENERATED_PROFILE_PREFIX}${slug(baseAgent)}__${slug(modelId)}_${stableHash(`${baseAgent}|${modelId}`).slice(0, 6)}`;
 }
 
-function isGeneratedProfile(name: string): boolean {
-  return name.startsWith(GENERATED_PROFILE_PREFIX);
+const MANAGED_ALIAS_PATTERN = /^__mf_[a-z0-9]+(?:-[a-z0-9]+)*__[a-z0-9]+(?:-[a-z0-9]+)*_[a-z0-9]{1,6}(?:-fallback)?$/;
+
+export function isManagedGeneratedAlias(name: string): boolean {
+  return MANAGED_ALIAS_PATTERN.test(name);
 }
 
 function isVariantProfile(name: string): boolean {
@@ -86,7 +90,7 @@ function isVariantProfile(name: string): boolean {
 }
 
 function isBasePhaseAgent(name: string, prefixes: readonly string[]): boolean {
-  if (isGeneratedProfile(name) || isVariantProfile(name)) return false;
+  if (isManagedGeneratedAlias(name) || isVariantProfile(name)) return false;
   return prefixes.some((prefix) => name.startsWith(prefix));
 }
 
@@ -220,19 +224,85 @@ export function connectedModelsFromProviderList(providerList: unknown[]): Connec
   return out.sort((a, b) => a.modelId.localeCompare(b.modelId));
 }
 
-function allowGeneratedAliasWhereBaseIsAllowed(
-  agents: Record<string, JsonishRecord | undefined>,
+/**
+ * Design v4 (A6) — OpenCode task permissions use ordered wildcard matching;
+ * the LAST matching rule wins. `*` is a greedy segment wildcard. Returns
+ * true iff `agentName` is effectively ALLOWED under `taskPermission`.
+ *
+ * `taskPermission` may be the string `"allow"` (everything allowed), a
+ * string `"deny"`/other (nothing), or a Record whose keys are wildcard
+ * patterns evaluated in insertion order.
+ */
+export function wildcardMatch(pattern: string, agentName: string): boolean {
+  if (pattern === agentName) return true;
+  if (!pattern.includes("*")) return false;
+  // Escape regex specials, then turn `*` into `.*`.
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`).test(agentName);
+}
+
+export function effectiveTaskAllowed(taskPermission: unknown, agentName: string): boolean {
+  if (taskPermission === "allow") return true;
+  if (!isRecord(taskPermission)) return false;
+  let effective: unknown;
+  for (const [pattern, decision] of Object.entries(taskPermission)) {
+    if (!wildcardMatch(pattern, agentName)) continue;
+    effective = decision;
+  }
+  return effective === "allow";
+}
+
+/**
+ * Design v4 (A6) — propagate generated-alias permissions across every holder
+ * agent. For each holder with a structured `permission.task`:
+ *   - when the base agent is EFFECTIVELY allowed (ordered wildcard,
+ *     last-match-wins), set an EXACT `task[alias] = "allow"` for every
+ *     registered alias;
+ *   - remove STALE exact `__mf_` entries that are no longer registered
+ *     (keeps the task map tidy across reloads);
+ *   - NEVER infer orchestrator permission from map presence — only an
+ *     explicit allow rule grants the alias.
+ *
+ * Holders whose `task` is the string `"allow"` (allow-all) are left intact.
+ */
+export function propagateAliasPermissions(
+  holders: Record<string, { permission?: { task?: unknown } }>,
   baseAgent: string,
-  alias: string,
+  registeredAliases: readonly string[],
+  staleAliases: readonly string[],
 ): void {
-  for (const agent of Object.values(agents)) {
-    if (!isRecord(agent)) continue;
-    const permission = agent.permission;
-    if (!isRecord(permission)) continue;
-    const task = permission.task;
+  const registered = new Set(registeredAliases);
+  for (const holder of Object.values(holders)) {
+    if (!holder || typeof holder !== "object") continue;
+    const permission = holder.permission;
+    if (!permission || typeof permission !== "object") continue;
+    const task = (permission as { task?: unknown }).task;
     if (task === "allow") continue;
     if (!isRecord(task)) continue;
-    if (task[baseAgent] === "allow") task[alias] = "allow";
+    // Remove stale exact __mf_ entries.
+    for (const stale of staleAliases) {
+      if (Object.prototype.hasOwnProperty.call(task, stale)) {
+        delete (task as Record<string, unknown>)[stale];
+      }
+    }
+    // Add exact alias allow only when the base is effectively allowed.
+    if (effectiveTaskAllowed(task, baseAgent)) {
+      for (const alias of registered) {
+        if (!Object.prototype.hasOwnProperty.call(task, alias)) {
+          (task as Record<string, unknown>)[alias] = "allow";
+        }
+      }
+    } else {
+      // Ensure no stale exact allow clings to a now-denied alias.
+      for (const alias of registered) {
+        if (
+          Object.prototype.hasOwnProperty.call(task, alias) &&
+          (task as Record<string, unknown>)[alias] === "allow"
+        ) {
+          delete (task as Record<string, unknown>)[alias];
+        }
+      }
+    }
   }
 }
 
@@ -247,8 +317,12 @@ export function generateProfilesForConfig(
   if (!Array.isArray(connectedModels)) return { byBase: {} };
   config.agent = config.agent ?? {};
   const agents = config.agent;
+  const previouslyOwned = new Set(options.ownedAliases ?? []);
   for (const name of Object.keys(agents)) {
-    if (isGeneratedProfile(name)) delete agents[name];
+    if (previouslyOwned.has(name) || isManagedGeneratedAlias(name)) {
+      previouslyOwned.add(name);
+      delete agents[name];
+    }
   }
 
   const prefixes = options.phasePrefixes ?? [...DEFAULT_PHASE_PREFIXES];
@@ -360,7 +434,6 @@ export function generateProfilesForConfig(
       generatedAgent.hidden = true;
       generatedAgent.description = `Generated model forecast profile for ${baseAgent} on ${profile.modelId}`;
       agents[alias] = generatedAgent;
-      allowGeneratedAliasWhereBaseIsAllowed(agents, baseAgent, alias);
     }
 
     // Configure the second model of the top selected profiles as the fallback of the first one
@@ -374,12 +447,83 @@ export function generateProfilesForConfig(
       fallbackAgent.hidden = true;
       fallbackAgent.description = `Fallback profile for ${baseAgent} (from ${firstProfile.modelId} to ${secondProfile.modelId})`;
       agents[fallbackAlias] = fallbackAgent;
-      allowGeneratedAliasWhereBaseIsAllowed(agents, baseAgent, fallbackAlias);
     }
 
     catalog.byBase[baseAgent] = profilesToRegister;
   }
+
+  // Design v4 (A6) — propagate EXACT alias allows under ordered wildcard
+  // last-match-wins semantics, and remove only exact canonical managed aliases
+  // left by previous generations. Stale collection is GLOBAL so processing
+  // one base cannot evict another base's aliases from a shared task map.
+  const allRegistered = new Set<string>();
+  const perBaseRegistered: Record<string, string[]> = {};
+  for (const [baseAgent, profiles] of Object.entries(catalog.byBase)) {
+    const list: string[] = [];
+    for (const profile of profiles) {
+      list.push(profile.alias);
+      if (profiles.length >= 2 && profile.alias === profiles[0]!.alias) {
+        list.push(`${profile.alias}-fallback`);
+      }
+    }
+    perBaseRegistered[baseAgent] = list;
+    for (const alias of list) allRegistered.add(alias);
+  }
+  const staleAliases = collectStaleAliasKeys(agents, allRegistered);
+  for (const alias of previouslyOwned) {
+    if (!allRegistered.has(alias)) staleAliases.push(alias);
+  }
+  removeStaleAliasPermissions(agents, staleAliases);
+  for (const [baseAgent, registeredAliases] of Object.entries(perBaseRegistered)) {
+    propagateAliasPermissions(
+      agents as unknown as Record<string, { permission?: { task?: unknown } }>,
+      baseAgent,
+      registeredAliases,
+      [],
+    );
+  }
+  if (options.ownedAliases !== undefined) {
+    options.ownedAliases.clear();
+    for (const alias of allRegistered) options.ownedAliases.add(alias);
+  }
   return catalog;
+}
+
+function removeStaleAliasPermissions(
+  agents: Record<string, JsonishRecord | undefined>,
+  staleAliases: readonly string[],
+): void {
+  if (staleAliases.length === 0) return;
+  for (const agent of Object.values(agents)) {
+    if (!isRecord(agent)) continue;
+    const permission = agent.permission;
+    if (!isRecord(permission) || !isRecord(permission.task)) continue;
+    for (const stale of staleAliases) delete permission.task[stale];
+  }
+}
+
+/**
+ * Design v4 (A6) — collects exact canonical managed task-permission keys that
+ * are not in the current registered set. Prefix-only user keys are preserved.
+ */
+function collectStaleAliasKeys(
+  agents: Record<string, JsonishRecord | undefined>,
+  registered: Set<string>,
+): string[] {
+  const stale = new Set<string>();
+  for (const agent of Object.values(agents)) {
+    if (!isRecord(agent)) continue;
+    const permission = agent.permission;
+    if (!isRecord(permission)) continue;
+    const task = permission.task;
+    if (!isRecord(task)) continue;
+    for (const key of Object.keys(task)) {
+      if (isManagedGeneratedAlias(key) && !registered.has(key)) {
+        stale.add(key);
+      }
+    }
+  }
+  return [...stale];
 }
 
 function scoreInputForProfile(profile: GeneratedProfile): ScoreCandidateInput {
@@ -456,7 +600,7 @@ function baseAgentForGeneratedAlias(
   catalog: GeneratedProfileCatalog,
   subagentType: string,
 ): string | undefined {
-  if (!isGeneratedProfile(subagentType)) return undefined;
+  if (!isManagedGeneratedAlias(subagentType)) return undefined;
   for (const profiles of Object.values(catalog.byBase)) {
     for (const profile of profiles) {
       if (profile.alias === subagentType || `${profile.alias}-fallback` === subagentType) {
@@ -465,6 +609,27 @@ function baseAgentForGeneratedAlias(
     }
   }
   return undefined;
+}
+
+export function isGeneratedAliasRegistered(
+  catalog: GeneratedProfileCatalog,
+  ownedAliases: ReadonlySet<string>,
+  alias: string,
+  modelId: string,
+  originalSubagentType: string,
+): boolean {
+  if (!ownedAliases.has(alias)) return false;
+  const base = catalog.byBase[originalSubagentType] !== undefined
+    ? originalSubagentType
+    : baseAgentForGeneratedAlias(catalog, originalSubagentType) ??
+      normalizePhase(originalSubagentType).phase;
+  const profiles = catalog.byBase[base] ?? [];
+  if (profiles.some((profile) => profile.alias === alias && profile.modelId === modelId)) {
+    return true;
+  }
+  return profiles.length >= 2 &&
+    alias === `${profiles[0]!.alias}-fallback` &&
+    modelId === profiles[1]!.modelId;
 }
 
 export function createGeneratedProfileResolver(
@@ -487,10 +652,14 @@ export function createGeneratedProfileResolver(
     // currently quarantined. Empty/absent dep is a no-op (byte-identical
     // to the pre-change output) so callers that never opt in see no
     // behaviour change.
-    const quarantined = allProfiles.length;
+    const liveProfiles = deps.liveModels === undefined
+      ? allProfiles
+      : allProfiles.filter((profile) => deps.liveModels!.some((model) => model === profile.modelId));
+    if (liveProfiles.length === 0) return [];
+    const quarantined = liveProfiles.length;
     const profiles = options.quarantine
-      ? allProfiles.filter((p) => !options.quarantine!.isBlocked(p.modelId))
-      : allProfiles;
+      ? liveProfiles.filter((p) => !options.quarantine!.isBlocked(p.modelId))
+      : liveProfiles;
     if (profiles.length === 0) {
       options.logger?.info(
         "generateProfiles",

@@ -1,5 +1,5 @@
-/**
- * PR4 unit tests — OpenCode plugin entry point.
+﻿/**
+ * PR4 unit tests â€” OpenCode plugin entry point.
  *
  * RED phase: these tests reference `modelForecastPlugin` and `refreshCache`
  * from src/index.ts which is still the PR1 bootstrap stub. The full
@@ -30,9 +30,17 @@ import {
 } from "../src/plugin.js";
 import type { Discovery } from "../src/models.js";
 import type { TaskHook } from "../src/hooks.js";
-import type { LiveAvailabilityState } from "../src/types.js";
 
-describe("plugin — default export shape (no auto-injection)", () => {
+async function primeCacheFromClient(cachePath: string, client: unknown): Promise<void> {
+  await refreshCache({
+    cachePath,
+    gentleAiPath: `${cachePath}.missing-gentle`,
+    openCodePath: `${cachePath}.missing-opencode`,
+    client: client as never,
+  });
+}
+
+describe("plugin â€” default export shape (no auto-injection)", () => {
   it("returns an empty hooks object", async () => {
     const hooks = await modelForecastPlugin();
     expect(hooks).toEqual({});
@@ -56,7 +64,7 @@ describe("plugin — default export shape (no auto-injection)", () => {
   });
 });
 
-describe("plugin — fire-and-forget cache refresh", () => {
+describe("plugin â€” fire-and-forget cache refresh", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -87,7 +95,7 @@ describe("plugin — fire-and-forget cache refresh", () => {
     expect(cached?.rubric).toBeDefined();
   });
 
-  it("refreshCache() persists the static phase→tier rubric from phases.ts", async () => {
+  it("refreshCache() persists the static phaseâ†’tier rubric from phases.ts", async () => {
     const cachePath = path.join(tempDir, "model-data.json");
     await refreshCache({ cachePath });
 
@@ -112,7 +120,7 @@ describe("plugin — fire-and-forget cache refresh", () => {
     // Provide a gentle-ai variants file pointing at a temp path, then
     // observe that the cache absorbs it.
     const sourcesFile = path.join(tempDir, "sources.json");
-    // contents intentionally unused — refreshCache reads via customPath.
+    // contents intentionally unused â€” refreshCache reads via customPath.
     // We just verify that an explicit empty path still completes safely.
     await refreshCache({
       cachePath: path.join(tempDir, "model-data.json"),
@@ -202,13 +210,13 @@ describe("plugin — fire-and-forget cache refresh", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * 429-fallback — Plugin wiring.
+ * 429-fallback â€” Plugin wiring.
  * Spec #1316 requirement 5 (Loader-Compat and Gating). The after hook
  * MUST register ONLY when `mode === "auto"` AND `quarantine.enabled !==
  * false`. Default mode returns `{}`. `Object.keys(root) === ["default"]`
  * remains pinned by tests/smoke.test.ts.
  * -------------------------------------------------------------------------- */
-describe("plugin — 429-fallback gating", () => {
+describe("plugin â€” 429-fallback gating", () => {
   it("deduplicates recovery toasts by call and event", () => {
     const showToast = vi.fn();
     const emit = createRecoveryToastEmitter({ tui: { showToast } });
@@ -284,7 +292,7 @@ describe("plugin — 429-fallback gating", () => {
   });
 
   it("accepts a client with client.session.create/prompt (PluginClient widening) without throwing at construction", async () => {
-    // model-fallback-error-classification (SDD change) — Slice 3, task 21.
+    // model-fallback-error-classification (SDD change) â€” Slice 3, task 21.
     // Spec #1620 "Recursive Retry" / design #1623 "Client wiring": the
     // plugin must accept a structural `session?: {create?, prompt?}`
     // surface on the client WITHOUT importing an SDK type. Presence alone
@@ -308,7 +316,7 @@ describe("plugin — 429-fallback gating", () => {
     ]);
   });
 
-  it("missing client.session methods degrades gracefully — after-hook still quarantines on a 429, no crash, no fallback dispatch", async () => {
+  it("missing client.session methods degrades gracefully â€” after-hook still quarantines on a 429, no crash, no fallback dispatch", async () => {
     // Slice 3, task 21: a client present but WITHOUT session.create/prompt
     // (or no client at all) must not crash the after-hook; the fallback
     // engine simply cannot dispatch and the existing single-attempt
@@ -357,6 +365,7 @@ describe("plugin — 429-fallback gating", () => {
     const client = {
       provider: {
         list: async () => ({
+          connected: ["minimax"],
           all: [
             {
               id: "minimax",
@@ -377,10 +386,13 @@ describe("plugin — 429-fallback gating", () => {
         },
       },
     };
+    const cachePath = path.join(tempDir, "model-data.json");
+    await primeCacheFromClient(cachePath, client);
 
     const hooks = await modelForecastPlugin({ client }, {
       mode: "auto",
       quarantine: { filePath: path.join(tempDir, "quarantine.json") },
+      cachePath,
     });
 
     // Registration toast fires synchronously when auto mode returns hooks.
@@ -401,7 +413,7 @@ describe("plugin — 429-fallback gating", () => {
     const generationToast = toasts.find((t) => /generated \d+ profile/i.test(t.message));
     expect(generationToast).toBeDefined();
     expect(generationToast?.variant).toBe("success");
-    // One base agent (sdd-design) × one connected model = one profile.
+    // One base agent (sdd-design) Ã— one connected model = one profile.
     expect(generationToast?.message).toContain("generated 1 profile(s) across 1 base agent(s)");
   });
 
@@ -552,12 +564,13 @@ describe("plugin — 429-fallback gating", () => {
     const cachePath = path.join(tempDir, "model-data.json");
     try {
       // Provide a live client so the config hook generates profiles
-      // from a real model list — the resolver then produces a
+      // from a real model list â€” the resolver then produces a
       // non-empty candidate set and the before hook rewrites.
       const client = {
         provider: {
           list: async () => ({
             data: {
+              connected: ["google"],
               all: [
                 {
                   id: "google",
@@ -576,6 +589,7 @@ describe("plugin — 429-fallback gating", () => {
         },
         tui: { showToast: () => Promise.resolve(true) },
       };
+      await primeCacheFromClient(cachePath, client);
       const hooks = await modelForecastPlugin({ client }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
@@ -612,7 +626,7 @@ describe("plugin — 429-fallback gating", () => {
       beforeOutput,
     );
 
-    // The resolver must have produced a candidate → rewrite must have
+    // The resolver must have produced a candidate â†’ rewrite must have
     // happened. The rewritten subagent_type starts with the generated
     // alias prefix and must NOT contain any flash family model.
     const rewritten = beforeOutput.args.subagent_type as string;
@@ -637,7 +651,7 @@ describe("plugin — 429-fallback gating", () => {
     }
 
     // With a live client, the resolver produces a non-empty candidate
-    // set → before hook rewrites → after hook detects 429 and
+    // set â†’ before hook rewrites â†’ after hook detects 429 and
     // quarantines the tracked model. Assert the quarantine fired.
     expect(rewritten).toBeDefined();
     // The stderr warning must contain a quarantine message. The
@@ -653,7 +667,7 @@ describe("plugin — 429-fallback gating", () => {
   });
 
   it("end-to-end: fallback engine dispatches on a 429, overwrites output on success, and persists the attempt-1 quarantine", async () => {
-    // model-fallback-error-classification (SDD change) — Slice 3, task 28.
+    // model-fallback-error-classification (SDD change) â€” Slice 3, task 28.
     // Design #1623 Testing Strategy "Integration" row: after-hook
     // end-to-end with the tracking map + fallback engine + persistence of
     // the quarantine entry the attempt-1 failure produces.
@@ -665,6 +679,7 @@ describe("plugin — 429-fallback gating", () => {
         provider: {
           list: async () => ({
             data: {
+              connected: ["google"],
               all: [
                 {
                   id: "google",
@@ -693,6 +708,7 @@ describe("plugin — 429-fallback gating", () => {
         },
         tui: { showToast: () => Promise.resolve(true) },
       };
+      await primeCacheFromClient(cachePath, client);
       const hooks = await modelForecastPlugin({ client }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
@@ -735,14 +751,14 @@ describe("plugin — 429-fallback gating", () => {
         afterOutput,
       );
 
-      // The fallback engine dispatched and succeeded — output overwritten.
+      // The fallback engine dispatched and succeeded â€” output overwritten.
       expect(afterOutput.output).toBe("fallback model finished the task");
       const metadata = afterOutput.metadata as { mfFallback?: { attempts: number; model: string } } | undefined;
       expect(metadata?.mfFallback?.attempts).toBeGreaterThanOrEqual(2);
       expect(metadata?.mfFallback?.model).toContain("google/");
 
       // The attempt-1 failing model's quarantine entry was persisted to
-      // disk (permanent/manual entries aside — this asserts the plugin's
+      // disk (permanent/manual entries aside â€” this asserts the plugin's
       // saveToFile-on-change wiring still fires alongside the fallback
       // dispatch, i.e. Slice 3 does not regress Slice 1's persistence).
       const raw = await readFile(quarantinePath, "utf8").catch(() => "");
@@ -760,6 +776,7 @@ describe("plugin — 429-fallback gating", () => {
       const client = {
         provider: {
           list: async () => ({
+            connected: ["openai"],
             all: [
               {
                 id: "openai",
@@ -775,10 +792,13 @@ describe("plugin — 429-fallback gating", () => {
           },
         },
       };
+      const cachePath = path.join(tempDir, "model-data.json");
+      await primeCacheFromClient(cachePath, client);
 
       const hooks = await modelForecastPlugin({ client }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
+        cachePath,
       });
       const configHook = hooks["config"] as (config: unknown) => Promise<void>;
       const beforeHook = hooks["tool.execute.before"] as any;
@@ -847,6 +867,7 @@ describe("plugin — 429-fallback gating", () => {
         provider: {
           list: async () => ({
             data: {
+              connected: ["google"],
               all: [{
                 id: "google",
                 models: {
@@ -874,9 +895,12 @@ describe("plugin — 429-fallback gating", () => {
         },
         tui: { showToast: () => Promise.resolve(true) },
       };
+      const cachePath = path.join(tempDir, "model-data.json");
+      await primeCacheFromClient(cachePath, client);
       const hooks = await modelForecastPlugin({ client, directory: tempDir }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
+        cachePath,
         interruptionAudit: {
           dependencies: {
             now: () => "2026-07-15T12:34:56.789Z",
@@ -961,6 +985,7 @@ describe("plugin — 429-fallback gating", () => {
       const client = {
         provider: {
           list: async () => ({
+            connected: ["openai"],
             all: [
               {
                 id: "openai",
@@ -976,10 +1001,13 @@ describe("plugin — 429-fallback gating", () => {
           },
         },
       };
+      const cachePath = path.join(tempDir, "model-data.json");
+      await primeCacheFromClient(cachePath, client);
 
       const hooks = await modelForecastPlugin({ client }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
+        cachePath,
       });
       const configHook = hooks["config"] as (config: unknown) => Promise<void>;
       const beforeHook = hooks["tool.execute.before"] as any;
@@ -1039,7 +1067,7 @@ describe("plugin — 429-fallback gating", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * Regression — real OpenCode SDK client shape (class-instance provider).
+ * Regression â€” real OpenCode SDK client shape (class-instance provider).
  *
  * The OpenCode SDK exposes `client.provider` as a CLASS INSTANCE
  * (`class Provider extends _HeyApiClient`) whose `list()` method reads
@@ -1052,7 +1080,7 @@ describe("plugin — 429-fallback gating", () => {
  * These tests mirror the SDK shape so a plain-object mock cannot hide the
  * unbinding bug: the mock `list` reads `this._client` exactly like the SDK.
  * -------------------------------------------------------------------------- */
-describe("plugin — real SDK client shape (this-bound provider.list)", () => {
+describe("plugin â€” real SDK client shape (this-bound provider.list)", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -1096,9 +1124,12 @@ describe("plugin — real SDK client shape (this-bound provider.list)", () => {
     const client = makeSdkLikeClient([
       { id: "minimax", models: { "MiniMax-M3": { variants: { medium: {}, high: {} } } } },
     ]);
+    const cachePath = path.join(tempDir, "model-data.json");
+    await primeCacheFromClient(cachePath, client);
     const hooks = await modelForecastPlugin({ client }, {
       mode: "auto",
       quarantine: { filePath: path.join(tempDir, "quarantine.json") },
+      cachePath,
     });
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
 
@@ -1110,7 +1141,7 @@ describe("plugin — real SDK client shape (this-bound provider.list)", () => {
 
     const generationToast = client.toasts.find((t) => /generated \d+ profile/i.test(t.message));
     expect(generationToast).toBeDefined();
-    // One base agent (sdd-design) × one connected model = one profile.
+    // One base agent (sdd-design) Ã— one connected model = one profile.
     expect(generationToast?.message).toContain("generated 1 profile(s) across 1 base agent(s)");
   });
 
@@ -1175,7 +1206,7 @@ describe("plugin — real SDK client shape (this-bound provider.list)", () => {
 
   it("refreshCache fire-and-forget never surfaces an unhandled rejection", async () => {
     // A client whose provider.list rejects asynchronously must be fully
-    // absorbed — the fire-and-forget init path must not leak a rejection.
+    // absorbed â€” the fire-and-forget init path must not leak a rejection.
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown): void => {
       rejections.push(reason);
@@ -1201,13 +1232,13 @@ describe("plugin — real SDK client shape (this-bound provider.list)", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * 429-fallback — quarantine ↔ generated profile resolver integration.
+ * 429-fallback â€” quarantine â†” generated profile resolver integration.
  * Verifies that permanent quarantines loaded from file are active before
  * profile generation AND that explicitly-listed individual Flash aliases
- * (each a singleton — no implicit family expansion) are excluded from the
+ * (each a singleton â€” no implicit family expansion) are excluded from the
  * resolver output, leaving a non-Flash model to be chosen.
  * -------------------------------------------------------------------------- */
-describe("plugin — quarantine ↔ resolver integration (group expansion)", () => {
+describe("plugin â€” quarantine â†” resolver integration (group expansion)", () => {
   it("individual Flash aliases loaded from file are excluded from generated profiles (each a singleton)", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "plugin-qr-"));
     const quarantinePath = path.join(tempDir, "quarantine.json");
@@ -1215,7 +1246,7 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
       // Pre-write a persistent quarantine file listing each individual Flash
       // alias explicitly. Under the singleton contract, an individual id no
       // longer expands to its family, so both connected Flash models must be
-      // named to exclude them — leaving the non-Flash pro model available.
+      // named to exclude them â€” leaving the non-Flash pro model available.
       const { writeFile } = await import("fs/promises");
       await writeFile(
         quarantinePath,
@@ -1230,6 +1261,7 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
         provider: {
           list: async () => ({
             data: {
+              connected: ["google", "anthropic"],
               all: [
                 {
                   id: "google",
@@ -1271,10 +1303,13 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
         },
         tui: { showToast: () => Promise.resolve(true) },
       };
+      const cachePath = path.join(tempDir, "model-data.json");
+      await primeCacheFromClient(cachePath, client);
 
       const hooks = await modelForecastPlugin({ client }, {
         mode: "auto",
         quarantine: { filePath: quarantinePath },
+        cachePath,
       });
 
       const configHook = hooks["config"] as (config: unknown) => Promise<void>;
@@ -1309,7 +1344,7 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
       // pass trivially by keeping the original base subagent type.
       const chosen = output.args.subagent_type as string;
       expect(chosen).toMatch(/^__mf_sdd-design__/);
-      // The alias encodes the modelId — verify it doesn't contain "flash".
+      // The alias encodes the modelId â€” verify it doesn't contain "flash".
       expect(chosen).not.toMatch(/flash/i);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -1338,11 +1373,11 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
         cachePath,
       });
 
-      // Config hook calls clearNonPermanent() — permanent entries must survive.
+      // Config hook calls clearNonPermanent() â€” permanent entries must survive.
       const configHook = hooks["config"] as (config: unknown) => Promise<void>;
       await configHook({ agent: {} });
 
-      // Drive the before hook to trigger resolver — it calls quarantine.isBlocked().
+      // Drive the before hook to trigger resolver â€” it calls quarantine.isBlocked().
       const beforeHook = hooks["tool.execute.before"] as (
         input: unknown,
         output: { args: Record<string, unknown> },
@@ -1355,7 +1390,7 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
 
       // The resolver should have filtered out quarantined models.
       // Since the resolver is called and doesn't crash, the quarantine was loaded.
-      // The `subagent_type` may be rewritten or kept — either way, no crash.
+      // The `subagent_type` may be rewritten or kept â€” either way, no crash.
       expect(typeof output.args.subagent_type).toBe("string");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -1364,9 +1399,9 @@ describe("plugin — quarantine ↔ resolver integration (group expansion)", () 
 });
 
 /* -------------------------------------------------------------------------- *
- * Regression — generateProfilesForConfig resilience.
+ * Regression â€” generateProfilesForConfig resilience.
  * -------------------------------------------------------------------------- */
-describe("generateProfilesForConfig — empty / degenerate inputs", () => {
+describe("generateProfilesForConfig â€” empty / degenerate inputs", () => {
   it("returns an empty catalog when the connected-model list is empty", async () => {
     const { generateProfilesForConfig } = await import("../src/profiles.js");
     const catalog = generateProfilesForConfig(
@@ -1383,7 +1418,7 @@ describe("generateProfilesForConfig — empty / degenerate inputs", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * PR1 — refreshCache discovery sink
+ * PR1 â€” refreshCache discovery sink
  *
  * The plugin's `refreshCache` MUST retain its `Promise<void>` signature
  * and accept an OPTIONAL `discoverySink` callback that receives a
@@ -1397,7 +1432,7 @@ describe("generateProfilesForConfig — empty / degenerate inputs", () => {
  * the wiring so PR2's `runRefresh` can consume the discovery safely.
  * -------------------------------------------------------------------------- */
 
-describe("plugin — refreshCache discovery sink (PR1 wiring)", () => {
+describe("plugin â€” refreshCache discovery sink (PR1 wiring)", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -1410,7 +1445,7 @@ describe("plugin — refreshCache discovery sink (PR1 wiring)", () => {
 
   it("returns Promise<void> regardless of whether a sink is provided", async () => {
     const cachePath = path.join(tempDir, "model-data.json");
-    // No sink — must resolve to undefined and not throw.
+    // No sink â€” must resolve to undefined and not throw.
     await expect(refreshCache({ cachePath })).resolves.toBeUndefined();
   });
 
@@ -1538,7 +1573,7 @@ describe("plugin — refreshCache discovery sink (PR1 wiring)", () => {
 
   it("supports a no-op default when no discoverySink is provided", async () => {
     const cachePath = path.join(tempDir, "model-data.json");
-    // Just exercise the call path with NO sink — must complete safely.
+    // Just exercise the call path with NO sink â€” must complete safely.
     await expect(
       refreshCache({ cachePath }),
     ).resolves.toBeUndefined();
@@ -1546,7 +1581,7 @@ describe("plugin — refreshCache discovery sink (PR1 wiring)", () => {
 });
 
 /* -------------------------------------------------------------------------- *
- * Task 1 — session-scoped live availability state.
+ * Task 1 â€” session-scoped live availability state.
  *
  * Spec: the plugin must capture a session-scoped `LiveAvailabilityState`
  * from a single successful, bound, timeout-protected
@@ -1564,7 +1599,7 @@ describe("plugin — refreshCache discovery sink (PR1 wiring)", () => {
  * state stays unavailable.
  * -------------------------------------------------------------------------- */
 
-describe("plugin — computeLiveAvailabilityState (Task 1, success paths)", () => {
+describe("plugin â€” computeLiveAvailabilityState (Task 1, success paths)", () => {
   it("returns ready:true with a case-preserving Set on a successful live list", async () => {
     const client = {
       provider: {
@@ -1589,7 +1624,7 @@ describe("plugin — computeLiveAvailabilityState (Task 1, success paths)", () =
     expect(state.source).toBe("provider-list");
     expect(state.reason).toBe("");
     expect(state.models).toBeInstanceOf(Set);
-    // CASE-PRESERVING — match exactly what the SDK returned (no toLowerCase).
+    // CASE-PRESERVING â€” match exactly what the SDK returned (no toLowerCase).
     expect([...state.models].sort()).toEqual([
       "Anthropic/Claude-Opus-4-7",
       "google/Gemini-2.5-Pro",
@@ -1629,7 +1664,7 @@ describe("plugin — computeLiveAvailabilityState (Task 1, success paths)", () =
   });
 });
 
-describe("plugin — computeLiveAvailabilityState (Task 1, failure paths)", () => {
+describe("plugin â€” computeLiveAvailabilityState (Task 1, failure paths)", () => {
   it("returns ready:false with reason when no client is provided", async () => {
     const state = await computeLiveAvailabilityState({});
     expect(state.ready).toBe(false);
@@ -1736,7 +1771,7 @@ describe("plugin — computeLiveAvailabilityState (Task 1, failure paths)", () =
 
   it("does not throw even when withTimeout rejects", async () => {
     // Belt-and-suspenders: the helper must never propagate an exception
-    // to its caller (the plugin init path) — any throw would surface as
+    // to its caller (the plugin init path) â€” any throw would surface as
     // a startup failure.
     const client = {
       provider: { list: () => Promise.reject(new Error("boot race")) },
@@ -1747,7 +1782,7 @@ describe("plugin — computeLiveAvailabilityState (Task 1, failure paths)", () =
   });
 });
 
-describe("plugin — live availability state threaded into the task hook (Task 1)", () => {
+describe("plugin — post-bootstrap private live resolver", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -1758,12 +1793,14 @@ describe("plugin — live availability state threaded into the task hook (Task 1
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("exposes the live state on the returned task hook when the config hook succeeds", async () => {
+  it("keeps live state private and does not call provider.list from config", async () => {
+    const list = vi.fn(async () => ({
+      connected: ["google"],
+      all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
+    }));
     const client = {
       provider: {
-        list: async () => ({
-          all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
-        }),
+        list,
       },
       tui: { showToast: () => Promise.resolve(true) },
     };
@@ -1775,18 +1812,16 @@ describe("plugin — live availability state threaded into the task hook (Task 1
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
     await configHook({ agent: {} });
 
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live).toBeDefined();
-    expect(live?.ready).toBe(true);
-    expect(live?.source).toBe("provider-list");
-    expect([...(live?.models ?? [])]).toContain("google/gemini-2.5-pro");
+    expect(list).not.toHaveBeenCalled();
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
   });
 
-  it("returns a defensive live snapshot whose mutation cannot authorize an unavailable candidate", async () => {
+  it("does not expose mutable live state that could authorize an unavailable candidate", async () => {
     const unavailableModel = "openai/not-live";
     const client = {
       provider: {
         list: async () => ({
+          connected: ["openai"],
           all: [{ id: "openai", models: { "gpt-live": {} } }],
         }),
       },
@@ -1810,9 +1845,7 @@ describe("plugin — live availability state threaded into the task hook (Task 1
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
     await configHook({ agent: {} });
 
-    const exposed = beforeHook.getLiveAvailability?.();
-    expect(exposed?.ready).toBe(true);
-    (exposed?.models as Set<string>).add(unavailableModel);
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
 
     const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
     await beforeHook(
@@ -1820,11 +1853,10 @@ describe("plugin — live availability state threaded into the task hook (Task 1
       output,
     );
 
-    expect(beforeHook.getLiveAvailability?.().models.has(unavailableModel)).toBe(false);
     expect(output.args.subagent_type).toBe("sdd-design");
   });
 
-  it("exposes an unavailable live state when the client throws on provider.list", async () => {
+  it("keeps the default when the post-bootstrap provider request rejects", async () => {
     const client = {
       provider: {
         list: () => {
@@ -1841,14 +1873,16 @@ describe("plugin — live availability state threaded into the task hook (Task 1
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
     await configHook({ agent: {} });
 
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live).toBeDefined();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason.length).toBeGreaterThan(0);
-    expect(live?.models.size).toBe(0);
+    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
+    await beforeHook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "rejected-live" },
+      output,
+    );
+    expect(output.args.subagent_type).toBe("sdd-design");
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
   });
 
-  it("exposes an unavailable live state when no client is provided at all", async () => {
+  it("keeps the default when no live resolver client exists", async () => {
     const hooks = await modelForecastPlugin(undefined, {
       mode: "auto",
       quarantine: { filePath: path.join(tempDir, "quarantine.json") },
@@ -1857,10 +1891,13 @@ describe("plugin — live availability state threaded into the task hook (Task 1
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
     await configHook({ agent: {} });
 
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live).toBeDefined();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason.length).toBeGreaterThan(0);
+    const output = { args: { subagent_type: "sdd-design", prompt: "work" } };
+    await beforeHook(
+      { tool: { id: "task" }, sessionID: "s1", callID: "missing-client" },
+      output,
+    );
+    expect(output.args.subagent_type).toBe("sdd-design");
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
   });
 
   it("cache fallback populates the profile catalog while live state stays unavailable", async () => {
@@ -1902,9 +1939,8 @@ describe("plugin — live availability state threaded into the task hook (Task 1
       cachePath,
     });
 
-    // Live state MUST be unavailable (cache does not make it ready).
     const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(false);
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
 
     // Run the config hook so the cache fallback path generates profiles.
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
@@ -1927,473 +1963,6 @@ describe("plugin — live availability state threaded into the task hook (Task 1
       output,
     );
     expect(output.args.subagent_type).toBe("sdd-design");
-    // Live state still unavailable (cache did not flip it).
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(false);
-  });
-});
-
-/* -------------------------------------------------------------------------- *
- * Task 1.5 spec fix — live availability is captured ONLY from the config
- * hook's existing bound, timeout-protected `client.provider.list()` call.
- *
- * Review blocker: the previous implementation eagerly captured the state
- * at plugin init time, which (a) duplicated the SDK call (the config hook
- * also calls provider.list) and (b) almost always produced a permanently
- * unavailable state because providers are typically not ready when the
- * plugin loads. The approved plan requires the state to be derived from
- * the config hook's own live call, so:
- *   - No call at plugin init time.
- *   - Exactly one provider.list call through the config hook per session.
- *   - State starts unavailable with "config hook not yet called".
- *   - State flips to ready only after a successful config-hook call.
- *   - State flips to unavailable with a reason on every config-hook
- *     failure path (missing client/list, sync throw, rejected promise,
- *     timeout, malformed / empty result).
- *   - The state handed to `createTaskHook` is a live getter, not a
- *     snapshot — the hook always sees the current value.
- * -------------------------------------------------------------------------- */
-
-describe("plugin — spec fix: live availability captured from config hook only", () => {
-  let tempDir: string;
-
-  beforeEach(async () => {
-    tempDir = await mkdtemp(path.join(tmpdir(), "plugin-spec-fix-"));
-  });
-
-  afterEach(async () => {
-    await rm(tempDir, { recursive: true, force: true });
-  });
-
-  it("does NOT call provider.list during plugin init (no eager capture)", async () => {
-    let callCount = 0;
-    const client = {
-      provider: {
-        list: () => {
-          callCount += 1;
-          return Promise.resolve({ all: [] });
-        },
-      },
-    };
-    await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    expect(callCount).toBe(0);
-  });
-
-  it("calls provider.list exactly once via the config hook", async () => {
-    let callCount = 0;
-    const client = {
-      provider: {
-        list: () => {
-          callCount += 1;
-          return Promise.resolve({
-            all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
-          });
-        },
-      },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    // No call yet at init time.
-    expect(callCount).toBe(0);
-    // One call after the config hook fires.
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    expect(callCount).toBe(1);
-  });
-
-  it("live state starts unavailable with reason before the config hook runs", async () => {
-    const client = {
-      provider: {
-        list: async () => ({ all: [{ id: "google", models: { "gemini-2.5-pro": {} } }] }),
-      },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live).toBeDefined();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason.length).toBeGreaterThan(0);
-  });
-
-  it("live state flips to ready after a successful config-hook call", async () => {
-    const client = {
-      provider: {
-        list: async () => ({
-          all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
-        }),
-      },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    // Before config hook fires → unavailable.
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(false);
-    // After config hook fires with valid list → ready, case-preserving Set.
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(true);
-    expect(live?.source).toBe("provider-list");
-    expect(live?.reason).toBe("");
-    expect([...(live?.models ?? [])]).toEqual(["google/gemini-2.5-pro"]);
-  });
-
-  it("live state flips to unavailable when config hook's provider.list throws synchronously", async () => {
-    const client = {
-      provider: {
-        list: () => {
-          throw new Error("boot race");
-        },
-      },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason).toMatch(/threw/i);
-    expect(live?.models.size).toBe(0);
-  });
-
-  it("live state flips to unavailable when config hook's provider.list rejects", async () => {
-    const client = {
-      provider: {
-        list: () => Promise.reject(new Error("offline")),
-      },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason).toMatch(/threw/i);
-  });
-
-  it("live state flips to unavailable when config hook's provider.list returns malformed data", async () => {
-    const client = {
-      provider: { list: async () => "not-an-object" },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(false);
-    expect(live?.models.size).toBe(0);
-  });
-
-  it("live state flips to unavailable when config hook's provider.list returns empty data", async () => {
-    const client = {
-      provider: { list: async () => ({ all: [] }) },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason).toMatch(/no models|empty/i);
-  });
-
-  it("live state stays unavailable when no client is provided (config hook cannot fix that)", async () => {
-    const hooks = await modelForecastPlugin(undefined, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({ agent: {} });
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(false);
-    expect(live?.reason.length).toBeGreaterThan(0);
-  });
-
-  it("getter returns the LIVE state, not a stale snapshot", async () => {
-    // Two config-hook calls: the first returns a real model (ready), the
-    // second returns an empty list (unavailable). The getter must reflect
-    // the latest call — proving it is NOT a snapshot taken at init time.
-    let callCount = 0;
-    const client = {
-      provider: {
-        list: async () => {
-          callCount += 1;
-          if (callCount === 1) {
-            return { all: [{ id: "google", models: { "gemini-2.5-pro": {} } }] };
-          }
-          return { all: [] };
-        },
-      },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-    });
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-
-    // First config-hook call → ready.
-    await configHook({ agent: {} });
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(true);
-
-    // Second config-hook call (empty) → unavailable.
-    await configHook({ agent: {} });
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(false);
-  });
-
-  it("does not add a second provider.list call: cache fallback path is purely advisory", async () => {
-    // When the live call fails the config hook falls back to reading the
-    // on-disk cache. That fallback MUST NOT trigger a second
-    // provider.list call.
-    let callCount = 0;
-    const client = {
-      provider: {
-        list: () => {
-          callCount += 1;
-          return Promise.reject(new Error("offline"));
-        },
-      },
-      tui: { showToast: () => Promise.resolve(true) },
-    };
-    const cachePath = path.join(tempDir, "model-data.json");
-    await writeFile(
-      cachePath,
-      JSON.stringify({
-        version: 1,
-        generatedAt: new Date().toISOString(),
-        providers: {
-          google: { "gemini-2.5-pro": { variants: ["high"] } },
-        },
-        rubric: {},
-      }),
-      "utf8",
-    );
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { filePath: path.join(tempDir, "quarantine.json") },
-      cachePath,
-    });
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    await configHook({
-      agent: {
-        "sdd-design": { mode: "subagent", model: "google/gemini-2.5-pro", prompt: "p" },
-      },
-    });
-    // Exactly one call: the config hook's attempt.
-    expect(callCount).toBe(1);
-    // Live state is unavailable (cache fallback did not flip it).
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(false);
-  });
-});
-
-/* -------------------------------------------------------------------------- *
- * Task 1 reliability fixes.
- *
- * These tests pin three fail-closed guarantees before Task 2 consumes the
- * getter:
- *   1. Any config invocation that cannot reach provider.list invalidates a
- *      prior ready snapshot, including generatedProfiles.enabled:false and
- *      pre-provider setup errors.
- *   2. The production config hook (not only the standalone helper) enforces
- *      the real 5-second provider-list timeout.
- *   3. Concurrent config calls are last-invocation-wins for availability;
- *      a slow older call cannot overwrite a newer completed call.
- * -------------------------------------------------------------------------- */
-
-describe("plugin — Task 1 live availability reliability", () => {
-  let tempDir: string;
-
-  beforeEach(async () => {
-    tempDir = await mkdtemp(path.join(tmpdir(), "plugin-live-reliability-"));
-  });
-
-  afterEach(async () => {
-    vi.useRealTimers();
-    await rm(tempDir, { recursive: true, force: true });
-  });
-
-  it("resets a prior ready state when generated profiles are disabled", async () => {
-    let providerListCalls = 0;
-    const generatedProfiles: { enabled?: boolean } = { enabled: true };
-    const client = {
-      provider: {
-        list: async () => {
-          providerListCalls += 1;
-          return {
-            all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
-          };
-        },
-      },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      generatedProfiles,
-      quarantine: { enabled: false },
-      cachePath: path.join(tempDir, "model-data.json"),
-    });
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-
-    await configHook({ agent: {} });
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(true);
-    expect(providerListCalls).toBe(1);
-
-    generatedProfiles.enabled = false;
-    await configHook({ agent: {} });
-
-    const live = beforeHook.getLiveAvailability?.();
-    expect(providerListCalls).toBe(1);
-    expect(live?.ready).toBe(false);
-    expect(live?.models.size).toBe(0);
-    expect(live?.reason).toMatch(/generated profiles.*disabled/i);
-  });
-
-  it("resets a prior ready state when config setup fails before provider.list", async () => {
-    let providerListCalls = 0;
-    let failDirectoryRead = false;
-    const client = {
-      provider: {
-        list: async () => {
-          providerListCalls += 1;
-          return {
-            all: [{ id: "google", models: { "gemini-2.5-pro": {} } }],
-          };
-        },
-      },
-    };
-    const input = {
-      client,
-      get directory(): undefined {
-        if (failDirectoryRead) throw new Error("pre-provider setup failed");
-        return undefined;
-      },
-    };
-    const hooks = await modelForecastPlugin(input, {
-      mode: "auto",
-      quarantine: { enabled: false },
-      cachePath: path.join(tempDir, "model-data.json"),
-    });
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-
-    await configHook({ agent: {} });
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(true);
-    expect(providerListCalls).toBe(1);
-
-    failDirectoryRead = true;
-    await expect(configHook({ agent: {} })).resolves.toBeUndefined();
-
-    const live = beforeHook.getLiveAvailability?.();
-    expect(providerListCalls).toBe(1);
-    expect(live?.ready).toBe(false);
-    expect(live?.models.size).toBe(0);
-    expect(live?.reason).toMatch(/before provider\.list.*pre-provider setup failed/i);
-  });
-
-  it("times out the production config-hook provider.list call after exactly 5 seconds", async () => {
-    vi.useFakeTimers();
-    let providerListCalls = 0;
-    const neverSettles = new Promise<unknown>(() => {});
-    const client = {
-      provider: {
-        list: () => {
-          providerListCalls += 1;
-          return neverSettles;
-        },
-      },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { enabled: false },
-      cachePath: path.join(tempDir, "missing-model-data.json"),
-    });
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-
-    let settled = false;
-    const pending = configHook({ agent: {} }).finally(() => {
-      settled = true;
-    });
-
-    expect(providerListCalls).toBe(1);
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(settled).toBe(false);
-
-    await vi.advanceTimersByTimeAsync(1);
-    await pending;
-
-    const live = beforeHook.getLiveAvailability?.();
-    expect(settled).toBe(true);
-    expect(live?.ready).toBe(false);
-    expect(live?.models.size).toBe(0);
-    expect(live?.reason).toMatch(/timed out after 5000ms/i);
-  });
-
-  it("keeps the newer availability when an older concurrent config call resolves last", async () => {
-    const resolvers: Array<(value: unknown) => void> = [];
-    const client = {
-      provider: {
-        list: () => new Promise<unknown>((resolve) => resolvers.push(resolve)),
-      },
-    };
-    const hooks = await modelForecastPlugin({ client }, {
-      mode: "auto",
-      quarantine: { enabled: false },
-      cachePath: path.join(tempDir, "model-data.json"),
-    });
-    const configHook = hooks["config"] as (config: unknown) => Promise<void>;
-    const beforeHook = hooks["tool.execute.before"] as TaskHook;
-
-    const older = configHook({ agent: {} });
-    expect(resolvers).toHaveLength(1);
-    const newer = configHook({ agent: {} });
-    expect(resolvers).toHaveLength(2);
-
-    resolvers[1]?.({
-      all: [{ id: "NewProvider", models: { "NewModel": {} } }],
-    });
-    await newer;
-    expect(beforeHook.getLiveAvailability?.().ready).toBe(true);
-    expect([...(beforeHook.getLiveAvailability?.().models ?? [])]).toEqual([
-      "NewProvider/NewModel",
-    ]);
-
-    resolvers[0]?.({
-      all: [{ id: "OldProvider", models: { "OldModel": {} } }],
-    });
-    await older;
-
-    const live = beforeHook.getLiveAvailability?.();
-    expect(live?.ready).toBe(true);
-    expect([...(live?.models ?? [])]).toEqual(["NewProvider/NewModel"]);
+    expect(beforeHook.getLiveAvailability).toBeUndefined();
   });
 });

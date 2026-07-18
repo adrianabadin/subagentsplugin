@@ -41,7 +41,7 @@ import { createAfterHook, createTaskHook } from "../src/hooks.js";
 import { QuarantineStore } from "../src/quarantine.js";
 import { generatedProfileAlias } from "../src/profiles.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
-import modelForecastPlugin from "../src/plugin.js";
+import modelForecastPlugin, { refreshCache } from "../src/plugin.js";
 import type { Logger } from "../src/logger.js";
 import type { HooksConfig, LadderRung, SelectDecision } from "../src/types.js";
 
@@ -655,6 +655,7 @@ describe("modelForecastPlugin — wires AttemptCoordinator end-to-end", () => {
       provider: {
         list: async () => ({
           data: {
+            connected: ["google"],
             all: [
               {
                 id: "google",
@@ -685,6 +686,12 @@ describe("modelForecastPlugin — wires AttemptCoordinator end-to-end", () => {
       },
       tui: { showToast: () => Promise.resolve(true) },
     };
+    await refreshCache({
+      cachePath,
+      gentleAiPath: path.join(tempDir, "missing-gentle.json"),
+      openCodePath: path.join(tempDir, "missing-opencode.json"),
+      client,
+    });
     const hooks = await modelForecastPlugin(
       { client },
       {

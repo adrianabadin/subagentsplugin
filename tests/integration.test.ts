@@ -63,6 +63,7 @@ import { runCli } from "../src/cli.js";
 import { createTaskHook } from "../src/hooks.js";
 import { DEFAULT_LADDER } from "../src/policy.js";
 import { select as defaultSelect } from "../src/select.js";
+import { generatedProfileAlias } from "../src/profiles.js";
 import type { SelectCandidate } from "../src/types.js";
 
 const SKILL_PATH = path.resolve(
@@ -75,7 +76,7 @@ const SKILL_PATH = path.resolve(
 /** Shape of the optional `client` argument the plugin accepts. */
 interface MockClient {
   provider: {
-    list: () => Promise<unknown> | unknown;
+    list: (options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
   };
 }
 
@@ -89,6 +90,7 @@ function buildMockClient(providerId: string, modelId: string, variants: string[]
     provider: {
       list: async () => ({
         data: {
+          connected: [providerId],
           all: [
             {
               id: providerId,
@@ -147,10 +149,12 @@ describe("integration — plugin entry + CLI regression pin (PR3 task 3.1)", () 
   });
 
   it("modelForecastPlugin() forwards resolveCandidates to the auto hook", async () => {
+    const model = "openai/gpt-5.5";
+    const generatedAlias = generatedProfileAlias("sdd-design", model);
     const candidates: SelectCandidate[] = [
       {
-        subagent_type: "sdd-design-alto",
-        model: "openai/gpt-5.5",
+        subagent_type: generatedAlias,
+        model,
         effort: "high",
         confidence: 0.95,
         evidence: "e2e resolver supplied curated candidate",
@@ -167,14 +171,20 @@ describe("integration — plugin entry + CLI regression pin (PR3 task 3.1)", () 
       denylist: [],
       resolveCandidates: () => candidates,
       quarantine: { filePath: path.join(tempDir, "quarantine.json") },
+      cachePath: path.join(tempDir, "model-data.json"),
     };
 
+    const client = buildMockClient("openai", "gpt-5.5", ["high"]);
+    await refreshCache(await isolatedOptions(tempDir, {
+      cachePath: options.cachePath,
+      client,
+    }));
     const hooks = await modelForecastPlugin(
-      { client: buildMockClient("openai", "gpt-5.5", ["high"]) },
+      { client },
       options,
     );
     await (hooks.config as (config: { agent: Record<string, unknown> }) => Promise<void>)({
-      agent: {},
+      agent: { "sdd-design": { mode: "subagent", prompt: "design" } },
     });
     const hook = hooks["tool.execute.before"] as (
       input: { tool: { id: string }; sessionID: string; callID: string },
@@ -184,38 +194,23 @@ describe("integration — plugin entry + CLI regression pin (PR3 task 3.1)", () 
 
     await hook({ tool: { id: "task" }, sessionID: "s1", callID: "c1" }, output);
 
-    expect(output.args.subagent_type).toBe("sdd-design-alto");
+    expect(output.args.subagent_type).toBe(generatedAlias);
   });
 
   it("modelForecastPlugin() generates per-phase model profiles and routes tasks through them", async () => {
+    const client = buildMockClient("openai", "gpt-4.1", ["high"]);
+    const cachePath = path.join(tempDir, "model-data.json");
+    await refreshCache(await isolatedOptions(tempDir, { cachePath, client }));
     const hooks = await modelForecastPlugin(
       {
-        client: {
-          provider: {
-            list: async () => ({
-              data: {
-                all: [
-                  {
-                    id: "openai",
-                    models: {
-                      "gpt-4.1": {
-                        variants: {},
-                        cost: { input: 2, output: 8 },
-                        limit: { context: 1_000_000, output: 32_000 },
-                        status: "active",
-                      },
-                    },
-                  },
-                ],
-              },
-            }),
-          },
-        },
+        client,
       },
       {
         mode: "auto",
         confidenceThreshold: 0.6,
         allowlist: ["sdd-design"],
+        cachePath,
+        quarantine: { filePath: path.join(tempDir, "quarantine.json") },
       },
     );
     const cfg: { agent: Record<string, any> } = {

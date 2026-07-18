@@ -19,7 +19,7 @@ import path from "node:path";
 
 import { AttemptCoordinator } from "../src/attempt-coordinator.js";
 import { createEventHook } from "../src/opencode-event-hook.js";
-import modelForecastPlugin from "../src/plugin.js";
+import modelForecastPlugin, { refreshCache } from "../src/plugin.js";
 import type { FallbackResult } from "../src/fallback.js";
 import type { Logger } from "../src/logger.js";
 
@@ -311,6 +311,7 @@ describe("modelForecastPlugin — registers and drives the event hook", () => {
       provider: {
         list: async () => ({
           data: {
+            connected: ["google"],
             all: [
               {
                 id: "google",
@@ -345,7 +346,14 @@ describe("modelForecastPlugin — registers and drives the event hook", () => {
 
   it("dispatches the fallback engine from a 429 event BEFORE any tool.execute.after (merge gate)", async () => {
     const client = pluginClient();
-    const hooks = await modelForecastPlugin({ client }, { mode: "auto", ...(await makeOpts()) });
+    const options = await makeOpts();
+    await refreshCache({
+      cachePath: options.cachePath,
+      gentleAiPath: path.join(tempDir, "missing-gentle.json"),
+      openCodePath: path.join(tempDir, "missing-opencode.json"),
+      client,
+    });
+    const hooks = await modelForecastPlugin({ client }, { mode: "auto", ...options });
 
     const configHook = hooks["config"] as (config: unknown) => Promise<void>;
     await configHook({ agent: { "sdd-design": { mode: "subagent", model: "google/gemini-2.5-pro", prompt: "Design" } } });

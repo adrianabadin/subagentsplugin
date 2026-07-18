@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -107,7 +107,9 @@ describe("profiles — generated phase × model aliases", () => {
       "openai/gpt-4.1-mini",
     );
 
-    expect(cfg.agent[`${GENERATED_PROFILE_PREFIX}stale`]).toBeUndefined();
+    expect(cfg.agent[`${GENERATED_PROFILE_PREFIX}stale`]).toMatchObject({
+      model: "openai/old",
+    });
     expect(cfg.agent[designOpenAiAlias]).toMatchObject({
       mode: "subagent",
       model: "openai/gpt-4.1-mini",
@@ -556,6 +558,30 @@ describe("createGeneratedProfileResolver() — 429-fallback quarantine filter", 
 
     expect(candidates.map((c) => c.model)).toEqual(["openai/gpt-5.5"]);
     expect(candidates[0]?.subagent_type).toBe(fallback.alias);
+  });
+
+  it("applies exact live eligibility before quarantine and scoring", () => {
+    const quarantine = { isBlocked: vi.fn(() => false) };
+    const resolver = createGeneratedProfileResolver(
+      {
+        byBase: {
+          "sdd-design": [
+            makeProfile("minimax/disconnected", "minimax"),
+            makeProfile("openai/connected", "openai"),
+          ],
+        },
+      },
+      { quarantine },
+    );
+
+    const candidates = resolver({
+      ...deps,
+      liveModels: ["openai/connected"],
+    });
+
+    expect(candidates.map((candidate) => candidate.model)).toEqual(["openai/connected"]);
+    expect(quarantine.isBlocked).toHaveBeenCalledOnce();
+    expect(quarantine.isBlocked).toHaveBeenCalledWith("openai/connected");
   });
 });
 

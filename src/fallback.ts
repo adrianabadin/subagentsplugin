@@ -45,6 +45,7 @@
 import type { QuarantineErrorType, QuarantineStore } from "./quarantine.js";
 import type { LadderRung } from "./types.js";
 import type { Logger } from "./logger.js";
+import { readyLiveModels, type LiveOutcomeSnapshot } from "./live-filter.js";
 import type { OpenCodeClient } from "./opencode-client.js";
 export type { OpenCodeClient } from "./opencode-client.js";
 /** @deprecated Use OpenCodeClient from opencode-client instead. */
@@ -162,6 +163,15 @@ export interface FallbackEngineDeps {
   abortTimeoutMs?: number;
   /** Retired child IDs retained as bounded late-event tombstones. Active IDs are never evicted. */
   fallbackSessionTombstoneLimit?: number;
+  /**
+   * Design v4 — shared live resolver injection (contract D). When present,
+   * immediately before every real `session.prompt({model})` the engine
+   * requires exact live membership + quarantine: a disconnected candidate
+   * is SKIPPED and the next ranked fallback is tried; when live is
+   * unavailable, the engine dispatches NONE and preserves the current
+   * safe (exhausted) result. Absent => legacy dispatch behavior.
+   */
+  resolveLive?: () => Promise<LiveOutcomeSnapshot>;
 }
 
 export interface FallbackRunParams {
@@ -417,6 +427,7 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
   const sessionPromptTimeoutMs = deps.sessionPromptTimeoutMs ?? ATTEMPT_HARD_TIMEOUT_MS;
   const abortTimeoutMs = deps.abortTimeoutMs ?? DEFAULT_ABORT_TIMEOUT_MS;
   const nowFn = deps.now ?? ((): Date => new Date());
+  const resolveLive = deps.resolveLive;
   const attemptedProviders = new Set<string>();
   const providerHadError = new Set<string>();
 
@@ -600,6 +611,36 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       const nextProvider = providerFor(nextModel);
       if (nextProvider.length > 0) attemptedProviders.add(nextProvider);
 
+      const liveDispatchStatus = async (): Promise<"ready" | "skip" | "unavailable"> => {
+        if (quarantine.isBlocked(nextModel)) return "skip";
+        if (resolveLive === undefined) return "ready";
+        let liveOutcome: LiveOutcomeSnapshot;
+        try {
+          liveOutcome = await resolveLive();
+        } catch {
+          liveOutcome = { status: "unavailable", models: [] };
+        }
+        const liveModels = readyLiveModels(liveOutcome);
+        if (liveModels === undefined) return "unavailable";
+        if (!liveModels.some((id) => id === nextModel)) {
+          return "skip";
+        }
+        return "ready";
+      };
+
+      // Avoid creating a child session for a candidate already known to be
+      // disconnected or quarantined. The same checks are repeated immediately
+      // before prompt because either source can change while create is pending.
+      const preCreateStatus = await liveDispatchStatus();
+      if (preCreateStatus === "unavailable") {
+        logger?.info("fallback", `live unavailable; dispatching no fallback for ${params.originalSubagentType}`);
+        break;
+      }
+      if (preCreateStatus === "skip") {
+        logger?.info("fallback", `skipping unavailable fallback candidate ${nextModel}; trying next`);
+        continue;
+      }
+
       const attemptStartedAt = nowMs(nowFn);
       let sessionId: string | undefined;
 
@@ -662,6 +703,35 @@ export function createFallbackEngine(deps: FallbackEngineDeps): FallbackEngine {
       markInternal(sessionId, params.taskCallID);
 
       const { providerID, modelID } = splitModelId(nextModel);
+
+      const cleanupSkippedChild = async (reason: string): Promise<void> => {
+        try {
+          if (typeof sessionApi!.abort === "function") {
+            await abortFailedPrompt(sessionApi! as SessionApiWithAbort, {
+              sessionID: sessionId!,
+              parentSessionID: params.sessionID,
+              ...(params.callID !== undefined ? { callID: params.callID } : {}),
+              attemptID: `fallback-pre-prompt-${attempts.length + 1}`,
+              origin: "fallback_prompt",
+              reason,
+            });
+          }
+        } finally {
+          unmarkInternal(sessionId!);
+        }
+      };
+
+      const prePromptStatus = await liveDispatchStatus();
+      if (prePromptStatus === "unavailable") {
+        logger?.info("fallback", `live unavailable immediately before prompt; dispatching none for ${params.originalSubagentType}`);
+        await cleanupSkippedChild("fallback_live_unavailable");
+        break;
+      }
+      if (prePromptStatus === "skip") {
+        logger?.info("fallback", `candidate ${nextModel} became unavailable before prompt; trying next`);
+        await cleanupSkippedChild("fallback_candidate_unavailable");
+        continue;
+      }
 
       const attemptNumber = attempts.length + 1;
       let promptResult: unknown;

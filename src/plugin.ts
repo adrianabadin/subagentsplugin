@@ -16,8 +16,8 @@
  *
  * `refreshCache()` is exported as a standalone function for the CLI,
  * programmatic callers, and unit tests. It is NOT called at plugin init
- * (the config hook drives profile generation from the live provider list
- * or the on-disk cache directly).
+ * (the config hook drives profile generation from deterministic local cache
+ * data; post-bootstrap dispatch authorization owns live provider discovery).
  *
  * Cache format follows `ModelDataCache` from src/types.ts. Never throws —
  * best-effort by design.
@@ -46,11 +46,13 @@ import {
   connectedModelsFromProviderList,
   createGeneratedProfileResolver,
   generateProfilesForConfig,
+  isGeneratedAliasRegistered,
   type GeneratedProfileCatalog,
 } from "./profiles.js";
 import { PHASE_DIFFICULTY, normalizePhase } from "./phases.js";
 import { createAfterHook, createTaskHook, toolID, type TaskHook } from "./hooks.js";
 import { createFallbackEngine } from "./fallback.js";
+import { createLiveResolver } from "./live-resolver.js";
 import { classifyError } from "./error-classification.js";
 import { createEventHook } from "./opencode-event-hook.js";
 import { QuarantineStore, setSharedQuarantineStore } from "./quarantine.js";
@@ -109,7 +111,7 @@ import type { OpenCodeSessionClient } from "./opencode-client.js";
  */
 export interface PluginClient {
   provider?: {
-    list?: () => Promise<unknown> | unknown;
+    list?: (options?: { signal?: AbortSignal }) => Promise<unknown> | unknown;
   };
   /**
    * OpenCode TUI surface. When present, `tui.showToast` renders an
@@ -942,6 +944,7 @@ export default async function modelForecastPlugin(
 
   const { name: projectName, dir: projectDir } = extractProjectInfo(input as Record<string, unknown> | undefined);
   const logger = new Logger(projectName, projectDir, { verbose: options?.verbose === true });
+  const liveResolver = createLiveResolver({ client, logger });
   const interruptionAudit = createInterruptionAuditSink(
     projectDir,
     options?.interruptionAudit?.dependencies,
@@ -962,6 +965,7 @@ export default async function modelForecastPlugin(
   showToastSafely(client, "model-forecast: active in auto mode", "info");
 
   const profileCatalog: GeneratedProfileCatalog = { byBase: {} };
+  const ownedGeneratedAliases = new Set<string>();
 
   // 429-fallback — quarantine layer. The store is created per plugin
   // instance so multiple instances stay isolated. `enabled: true` is
@@ -1061,45 +1065,6 @@ export default async function modelForecastPlugin(
     watchQuarantineFile(quarantineFilePath, quarantine, logger);
   }
 
-  // Task 1 — session-scoped live availability state.
-  //
-  // Spec (Task 1.5 fix): the state is captured ONLY from the config
-  // hook's existing bound, timeout-protected `client.provider.list()`
-  // call. We do NOT eagerly capture it here at plugin init (a) because
-  // OpenCode typically hasn't loaded providers yet, producing a
-  // permanently unavailable state, and (b) because doing so would
-  // duplicate the SDK call the config hook also makes.
-  //
-  // The state starts unavailable with a short reason and the config
-  // hook updates it from the outcome of its own live call. The
-  // `getLiveAvailability` closure reads the CURRENT value on every
-  // call so the task hook always observes the latest state (not a
-  // stale reference taken at construction time).
-  let liveAvailability = unavailableLiveAvailabilityState("config hook not yet called");
-  let latestConfigInvocation = 0;
-  const getLiveAvailability = (): Readonly<LiveAvailabilityState> => liveAvailability;
-  const setLiveAvailability = (
-    invocation: number,
-    next: LiveAvailabilityState,
-  ): void => {
-    // Last-invocation-wins: a slower earlier config call must never
-    // overwrite availability established by a newer invocation.
-    if (invocation !== latestConfigInvocation) {
-      logger.trace(
-        "liveAvailability",
-        `ignored stale config invocation=${invocation}; latest=${latestConfigInvocation}`,
-      );
-      return;
-    }
-    liveAvailability = next;
-    logger.info(
-      "liveAvailability",
-      next.ready
-        ? `ready models=${next.models.size} source=${next.source}`
-        : `unavailable: ${next.reason}`,
-    );
-  };
-
   const generatedProfileResolver = createGeneratedProfileResolver(
     profileCatalog,
     { ...(quarantineEnabled ? { quarantine } : {}), logger },
@@ -1131,7 +1096,14 @@ export default async function modelForecastPlugin(
       ladder: DEFAULT_LADDER,
       logger,
       ...(client !== undefined
-        ? { fallback: { client, enabled: fallbackEnabled, interruptionAudit } }
+        ? {
+            fallback: {
+              client,
+              enabled: fallbackEnabled,
+              interruptionAudit,
+              resolveLive: liveResolver.resolve,
+            },
+          }
         : {}),
       // Visibility: mirror the loud-advisory stderr line AND surface it
       // on-screen. The after hook emits this ONCE per quarantine event
@@ -1147,35 +1119,19 @@ export default async function modelForecastPlugin(
     });
   }
 
+  let configTransaction: Promise<void> | undefined;
   const hooks: Record<string, unknown> = {
-    config: async (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
-const invocation = ++latestConfigInvocation;
-      // Fail closed immediately. This invalidates any prior ready snapshot
-      // before generated-profile gating or pre-provider setup can fail.
-      setLiveAvailability(
-        invocation,
-        unavailableLiveAvailabilityState("provider.list not yet settled for this config invocation"),
-      );
-      let providerListAttempted = false;
+    config: (config: { agent?: Record<string, Record<string, unknown> | undefined> }) => {
+      if (configTransaction !== undefined) return configTransaction;
+      configTransaction = (async (): Promise<void> => {
       // OpenCode AWAITS the config hook; any rejection here surfaces as a
       // structured `Cause { failures: [...] }` and aborts startup. Wrap the
       // ENTIRE body so profile generation is strictly best-effort and can
       // never break config resolution.
       try {
-        // Only clear TTL-based quarantines (rate limits) on the FIRST
-        // config-hook invocation. Subsequent invocations are part of the
-        // same live session and must preserve any rate-limit quarantine
-        // added by the after hook between calls — otherwise a single
-        // 429 → quarantine → next configHook → cleared → re-rewritten
-        // loop would break the gate.
-        if (invocation === 1) {
-          quarantine.clearNonPermanent();
-        }
+        // OpenCode runs one awaited config transaction per plugin instance.
+        quarantine.clearNonPermanent();
         if (options?.generatedProfiles?.enabled === false) {
-          setLiveAvailability(
-            invocation,
-            unavailableLiveAvailabilityState("generated profiles are disabled"),
-          );
           return;
         }
         const hasInputDirectory =
@@ -1195,82 +1151,39 @@ const invocation = ++latestConfigInvocation;
             globalPath: options?.benchmarks?.globalPath,
           });
         }
-        let connectedModels = [] as ReturnType<typeof connectedModelsFromProviderList>;
+        let connectedModels = [] as ReturnType<typeof connectedModelsFromCache>;
         // Diagnostic: capture WHY zero profiles were produced so the user
         // can `grep model-forecast` and see the exact reason on screen.
         let reason = "";
-        // NOTE (this-binding): the OpenCode SDK exposes `client.provider`
-        // as a class instance (`class Provider extends _HeyApiClient`)
-        // whose `list()` reads `this._client`. Extracting the method into
-        // a bare reference and calling it (`listFn()`) loses the `this`
-        // binding and throws `Cannot read properties of undefined` INSIDE
-        // the SDK. We therefore invoke it bound to the provider instance.
-        //
-        // Task 1.5: the SAME call result is reused to update the
-        // session-scoped live availability state. No duplicate SDK call.
-        const provider = client?.provider;
-        const listFn = provider?.list;
-        if (typeof listFn !== "function") {
-          reason = client === undefined ? "no client at config time" : "provider.list unavailable";
-          setLiveAvailability(
-            invocation,
-            deriveLiveAvailabilityState({ client, listCallNotMade: true }),
-          );
-        } else {
-          let listResult: unknown;
-          let listError: unknown;
-          try {
-            providerListAttempted = true;
-            listResult = await withTimeout(
-              Promise.resolve(listFn.call(provider)),
-              LIVE_AVAILABILITY_TIMEOUT_MS,
-              "provider.list",
-            );
-            connectedModels = connectedModelsFromProviderList(extractProviderList(listResult));
-            if (connectedModels.length === 0) reason = "provider.list returned no models";
-          } catch (err) {
-            listError = err;
-            reason = `provider.list threw: ${err instanceof Error ? err.message : String(err)}`;
-            connectedModels = [];
-          }
-          // Update the session-scoped live availability state from this
-          // call's outcome. The pure derivation helper turns success /
-          // failure / timeout / malformed / empty into the right state.
-          setLiveAvailability(
-            invocation,
-            deriveLiveAvailabilityState({
-              client,
-              ...(listError !== undefined ? { listError } : { listResult }),
-            }),
-          );
-        }
-        // Fallback: when the live provider list is empty/unavailable at config
-        // time (OpenCode starts providers after the config hook fires), read
-        // the on-disk cache that refreshCache already wrote at plugin init.
-        // This guarantees the config hook always has a model catalog to work
-        // with, regardless of provider-list timing.
-        if (connectedModels.length === 0) {
-          try {
-            const effectiveFallbackCachePath = options?.cachePath ?? defaultCachePath();
-            const cached = await withTimeout(readCache(effectiveFallbackCachePath, logger), 3000, "readCache");
-            if (cached !== null && cached.providers) {
-              const fromCache = connectedModelsFromCache(cached.providers);
-              if (fromCache.length > 0) {
-                connectedModels = fromCache;
-                reason = `fallback: ${fromCache.length} model(s) from disk cache`;
-              } else {
-                reason = "disk cache had no models";
-              }
+        // Design v4 (A1) — the config hook NEVER calls provider.list. The
+        // live SDK call is reserved for the post-bootstrap live resolver
+        // (contract B), which owns dispatch authorization. Profile/catalog
+        // generation is built from the on-disk cache (written by
+        // `refreshCache`) plus the static benchmark registry, both of which
+        // are local deterministic reads. This keeps the config transaction
+        // free of generations/CAS and safe under OpenCode's single
+        // config-hook-pass contract.
+        try {
+          const effectiveCachePath = options?.cachePath ?? defaultCachePath();
+          const cached = await withTimeout(readCache(effectiveCachePath, logger), 3000, "readCache");
+          if (cached !== null && cached.providers) {
+            const fromCache = connectedModelsFromCache(cached.providers);
+            if (fromCache.length > 0) {
+              connectedModels = fromCache;
+              reason = `${fromCache.length} model(s) from disk cache`;
             } else {
-              reason = "no disk cache yet";
+              reason = "disk cache had no models";
             }
-          } catch {
-            reason = "disk cache read failed";
+          } else {
+            reason = "no disk cache yet";
           }
+        } catch {
+          reason = "disk cache read failed";
         }
         const generated = generateProfilesForConfig(config, connectedModels, {
           phasePrefixes: options?.generatedProfiles?.phasePrefixes,
           maxProfilesPerBase: 3,
+          ownedAliases: ownedGeneratedAliases,
         });
         profileCatalog.byBase = generated.byBase;
 
@@ -1307,14 +1220,6 @@ const invocation = ++latestConfigInvocation;
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!providerListAttempted) {
-          setLiveAvailability(
-            invocation,
-            unavailableLiveAvailabilityState(
-              `config hook failed before provider.list: ${message}`,
-            ),
-          );
-        }
         // Absorb any unexpected failure (e.g. a non-mutable config object)
         // so the config hook resolves and OpenCode does not report a
         // startup `Cause` failure. Best-effort, logged to stderr only.
@@ -1323,6 +1228,8 @@ const invocation = ++latestConfigInvocation;
           `hook failed: ${message}`,
         );
       }
+      })();
+      return configTransaction;
     },
     "tool.execute.before": wrapTaskHookForTrace(
       createTaskHook(hookConfig, {
@@ -1331,7 +1238,15 @@ const invocation = ++latestConfigInvocation;
         ...(quarantineEnabled && recoveryEnabled ? { coordinator } : {}),
         onTaskRegistered: (callID) => watchdog?.watch(callID, { waitingForBind: true }),
         ...(quarantineEnabled ? { quarantine } : {}),
-        getLiveAvailability,
+        live: { policy: "required", resolve: liveResolver.resolve },
+        isAliasRegistered: (alias, model, originalSubagentType) =>
+          isGeneratedAliasRegistered(
+            profileCatalog,
+            ownedGeneratedAliases,
+            alias,
+            model,
+            originalSubagentType,
+          ),
       }),
       logger,
     ),
@@ -1378,6 +1293,7 @@ const invocation = ++latestConfigInvocation;
             maxAttempts: 3,
             logger,
             coordinator,
+            resolveLive: liveResolver.resolve,
           })
         : undefined;
 

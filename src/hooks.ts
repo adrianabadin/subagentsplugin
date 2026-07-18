@@ -46,6 +46,12 @@ import { select as defaultSelect } from "./select.js";
 import { DEFAULT_LADDER } from "./policy.js";
 import { MISSING_EVIDENCE_CONFIDENCE } from "./evidence.js";
 import { normalizePhase } from "./phases.js";
+import {
+  applyLiveGate,
+  readyLiveModels,
+  type LiveGatePolicy,
+  type LiveOutcomeSnapshot,
+} from "./live-filter.js";
 import { QuarantineStore, resolveQuarantineTtlMs, type QuarantineBlocklist, type QuarantineErrorType } from "./quarantine.js";
 import { resolveRateLimitTtlMs } from "./rate-limit-reset.js";
 import {
@@ -132,6 +138,8 @@ export interface ResolveCandidatesDeps {
   policy: SelectionPolicy;
   /** Deeply isolated, frozen snapshot of the hook args (for richer signal mining). */
   args: Readonly<Record<string, unknown>>;
+  /** Exact live model IDs, supplied before the default resolver scores. */
+  liveModels?: readonly string[];
 }
 
 export interface TaskHookDependencies {
@@ -200,6 +208,36 @@ export interface TaskHookDependencies {
    * through unchanged, with no alias or family normalization.
    */
   quarantine?: QuarantineBlocklist;
+  /**
+   * Design v4 (contract C) — post-bootstrap live gate. When supplied, the
+   * hook awaits the live outcome and applies the EXACT live filter BEFORE
+   * `select()` so a disconnected candidate can neither win nor block a
+   * connected lower-scoring candidate. `policy: "required"` fail-safes to
+   * keep-default when live is unavailable; `policy: "disabled"` is the
+   * legacy compatibility bypass (no filter). When omitted, the legacy
+   * synchronous `getLiveAvailability` boundary gate is preserved.
+   */
+  live?: {
+    policy: LiveGatePolicy;
+    resolve: () => Promise<unknown>;
+  };
+  /** Proves that a selected alias/model pair is owned by the accepted catalog. */
+  isAliasRegistered?: (alias: string, model: string, originalSubagentType: string) => boolean;
+}
+
+function validatedCandidates(value: unknown): SelectCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const valid = value.every((candidate) => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const record = candidate as Record<string, unknown>;
+    return typeof record.subagent_type === "string" && record.subagent_type.length > 0 &&
+      typeof record.model === "string" && record.model.length > 0 &&
+      typeof record.effort === "string" &&
+      typeof record.confidence === "number" && Number.isFinite(record.confidence) &&
+      typeof record.evidence === "string" &&
+      typeof record.ladderRung === "string";
+  });
+  return valid ? value as SelectCandidate[] : [];
 }
 
 export function toolID(tool: HookInput["tool"]): string {
@@ -559,6 +597,7 @@ export interface AfterHookDeps {
     client: OpenCodeClient;
     enabled?: boolean;
     interruptionAudit?: InterruptionAuditSink;
+    resolveLive?: () => Promise<LiveOutcomeSnapshot>;
   };
 }
 
@@ -675,6 +714,7 @@ export function createAfterHook(deps: AfterHookDeps): AfterHook {
           logger,
           ...(coordinator !== undefined ? { coordinator } : {}),
           interruptionAudit: deps.fallback?.interruptionAudit,
+          resolveLive: deps.fallback?.resolveLive,
         })
        : undefined;
   const handledAfterCallIDs = new Set<string>();
@@ -941,6 +981,25 @@ export function createTaskHook(
       `intercepted task subagent_type=${original} phase=${context.phase} callID=${callID} threshold=${policy.confidenceThreshold}`,
     );
 
+    // Resolve and validate live membership before candidate generation. The
+    // default generated-profile resolver consumes `liveModels` before its
+    // quarantine and forecast scoring stages; injected resolver output is
+    // still filtered again below before `select()`.
+    let liveOutcome: unknown;
+    let liveModels: readonly string[] | undefined;
+    let liveGateRefusalCause: SelectionRefusalCause | undefined;
+    if (deps.live?.policy === "required") {
+      try {
+        liveOutcome = typeof deps.live.resolve === "function"
+          ? await deps.live.resolve()
+          : undefined;
+      } catch {
+        liveOutcome = undefined;
+      }
+      liveModels = readyLiveModels(liveOutcome);
+      if (liveModels === undefined) liveGateRefusalCause = "live_snapshot_unavailable";
+    }
+
     // PR3 (PR2 gate W1 closure) — synthesise the candidate set. The
     // default factory emits one cheapest-rung candidate so the
     // production hook is non-inert; orchestrators can swap in richer
@@ -948,13 +1007,17 @@ export function createTaskHook(
     let candidates: SelectCandidate[];
     const resolverArgs = isolatedResolverArgs(output.args);
     try {
-      candidates = resolveCandidates({
-        originalSubagentType: original,
-        ladder,
-        context,
-        policy,
-        args: resolverArgs,
-      });
+      const resolved = liveGateRefusalCause === "live_snapshot_unavailable"
+        ? []
+        : resolveCandidates({
+            originalSubagentType: original,
+            ladder,
+            context,
+            policy,
+            args: resolverArgs,
+            ...(liveModels !== undefined ? { liveModels } : {}),
+          });
+      candidates = validatedCandidates(resolved);
     } catch {
       // A custom resolver MUST NOT break the task call. Fall through
       // with the default factory's single candidate on the cheapest
@@ -963,13 +1026,14 @@ export function createTaskHook(
         "createTaskHook",
         `custom resolver threw for ${original}; falling back to default factory`,
       );
-      candidates = defaultCandidateFactory({
+      candidates = validatedCandidates(defaultCandidateFactory({
         originalSubagentType: original,
         ladder,
         context,
         policy,
         args: resolverArgs,
-      });
+        ...(liveModels !== undefined ? { liveModels } : {}),
+      }));
     }
 
     logger?.info(
@@ -983,6 +1047,38 @@ export function createTaskHook(
           )
           .join(""),
     );
+
+    // Design v4 (contract C) — live filter BEFORE select(). When the live
+    // seam is wired, the exact connected set removes disconnected candidates
+    // up-front so a connected lower-scoring candidate can win. The legacy
+    // synchronous boundary gate (below) is skipped in that case.
+    if (deps.live !== undefined) {
+      const gated = applyLiveGate(candidates, liveOutcome, deps.live.policy);
+      candidates = gated.candidates;
+      liveGateRefusalCause = gated.refusalCause ?? liveGateRefusalCause;
+    }
+
+    // Quarantine is part of candidate eligibility, not only a final-boundary
+    // assertion. Remove blocked candidates before selection so a blocked
+    // higher-ranked model cannot prevent an eligible lower-ranked model from
+    // being selected. The boundary check below remains as a race-safe recheck.
+    if (deps.select === undefined && deps.quarantine !== undefined && candidates.length > 0) {
+      const beforeQuarantine = candidates.length;
+      candidates = candidates.filter((candidate) => {
+        try {
+          return deps.quarantine?.isBlocked(candidate.model) !== true;
+        } catch {
+          return false;
+        }
+      });
+      if (
+        candidates.length === 0 &&
+        beforeQuarantine > 0 &&
+        liveGateRefusalCause === undefined
+      ) {
+        liveGateRefusalCause = "candidate_quarantined";
+      }
+    }
 
     const decision = decide({
       context,
@@ -1000,6 +1096,14 @@ export function createTaskHook(
     let refusedReason: string | null = null;
     let refusalCause: SelectionRefusalCause | undefined;
 
+    // Design v4: when the live gate emptied the candidate set (required +
+    // unavailable, or every candidate disconnected), select() returns
+    // keep-default. Surface the gate's refusal cause on the audit/warning.
+    if (liveGateRefusalCause !== undefined && decision.action !== "switch") {
+      refusalCause = liveGateRefusalCause;
+      refusedReason = `model refused (${refusalCause})`;
+    }
+
     if (decision.action === "switch" && decision.subagent_type.length === 0) {
       finalDecision = keepDefaultFrom(decision, "alias ladder missing; keeping default");
       refusedReason = "alias ladder missing";
@@ -1010,19 +1114,45 @@ export function createTaskHook(
     }
 
     if (finalDecision.action === "switch") {
-      let quarantined = false;
-      try {
-        quarantined = deps.quarantine?.isBlocked(finalDecision.model) === true;
-      } catch {
-        // Fail closed when quarantine state cannot prove eligibility.
-        quarantined = true;
+      if (deps.select !== undefined && deps.quarantine !== undefined) {
+        let quarantined = false;
+        try {
+          quarantined = deps.quarantine.isBlocked(finalDecision.model);
+        } catch {
+          quarantined = true;
+        }
+        if (quarantined) {
+          refusalCause = "candidate_quarantined";
+          refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
+          finalDecision = keepDefaultFrom(finalDecision, refusedReason);
+        }
       }
 
-      if (quarantined) {
-        refusalCause = "candidate_quarantined";
-        refusedReason = `model ${finalDecision.model} refused (${refusalCause})`;
-        finalDecision = keepDefaultFrom(finalDecision, refusedReason);
-      } else {
+      if (finalDecision.action === "switch") {
+        let registered = false;
+        try {
+          registered = deps.isAliasRegistered?.(
+            finalDecision.subagent_type,
+            finalDecision.model,
+            original,
+          ) === true;
+        } catch {
+          registered = false;
+        }
+        if (
+          !registered &&
+          (deps.isAliasRegistered !== undefined || deps.live?.policy === "required")
+        ) {
+          refusedReason = `alias ${finalDecision.subagent_type} is not a registered generated profile`;
+          finalDecision = keepDefaultFrom(finalDecision, `${refusedReason}; keeping default`);
+        }
+      }
+
+      if (finalDecision.action === "switch" && deps.live !== undefined) {
+        // Design v4: the async live gate already authorized this candidate
+        // (it survived applyLiveGate). Skip the legacy synchronous boundary
+        // check — it would otherwise re-gate on a stale config-hook snapshot.
+      } else if (finalDecision.action === "switch") {
         let liveAvailability: Readonly<LiveAvailabilityState> | undefined;
         try {
           liveAvailability = deps.getLiveAvailability?.();

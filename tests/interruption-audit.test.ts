@@ -146,14 +146,15 @@ describe("createInterruptionAuditSink()", () => {
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     const { sink, writes, stderr } = harness();
-    await sink({
+    const unsafeInput: unknown = {
       ...event("abort_rejected"),
       reason: "provider_timeout\nprompt api_key=SECRET",
       error: "Bearer sk-SECRET model output",
       prompt: "SECRET PROMPT",
       modelOutput: "SECRET OUTPUT",
       payload: circular,
-    } as InterruptionAuditEvent);
+    };
+    await sink(unsafeInput as InterruptionAuditEvent);
     await sink(event("abort_timeout", {
       reason: "r".repeat(65), error: "e".repeat(65),
     }));
