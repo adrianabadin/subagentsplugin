@@ -28,6 +28,6 @@ describe("E2E rate-limit recovery", () => {
     const packageJson = JSON.parse(
       await readFile(new URL("../../package.json", import.meta.url), "utf8"),
     ) as { exports: Record<string, unknown> };
-    expect(Object.keys(packageJson.exports).sort()).toEqual([".", "./api"]);
+    expect(Object.keys(packageJson.exports).sort()).toEqual([".", "./api", "./tui"]);
   });
 });

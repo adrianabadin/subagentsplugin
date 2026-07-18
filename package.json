@@ -1,6 +1,6 @@
 {
   "name": "@aabadin/opencode-model-forecast",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Model + effort forecast plugin for OpenCode with supervised multi-provider fallback recovery.",
   "type": "module",
   "private": false,
@@ -13,6 +13,10 @@
     "./api": {
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
     }
   },
   "bin": {
